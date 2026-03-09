@@ -230,7 +230,7 @@ class Bench:
                     address,
                     bench_parameters.tx_size,
                     rate_share,
-                    [x for y in workers_addresses for _, x in y]
+                    [x for y in workers_addresses for wid, x in y if wid == id]
                 )
                 log_file = PathMaker.client_log_file(i, id)
                 self._background_run(host, cmd, log_file)
@@ -369,3 +369,4 @@ class Bench:
                             e = FabricError(e)
                         Print.error(BenchError('Benchmark failed', e))
                         continue
+

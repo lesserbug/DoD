@@ -10,6 +10,7 @@ use ed25519_dalek::{Digest as _, Sha512};
 #[cfg(feature = "benchmark")]
 use log::info;
 use network::ReliableSender;
+use std::collections::HashMap;
 #[cfg(feature = "benchmark")]
 use std::convert::TryInto as _;
 use std::net::SocketAddr;
@@ -21,7 +22,29 @@ use tokio::time::{sleep, Duration, Instant};
 pub mod batch_maker_tests;
 
 pub type Transaction = Vec<u8>;
-pub type Batch = Vec<Transaction>;
+
+#[derive(Clone, serde::Serialize, serde::Deserialize, Default, Debug, PartialEq, Eq)]
+pub struct Batch {
+    pub transactions: Vec<Transaction>,
+    // Local-order dependency edges: (previous_tx_id, current_tx_id).
+    pub edges: Vec<(u64, u64)>,
+}
+
+fn parse_standard_transaction(tx: &[u8]) -> Option<(u64, u8)> {
+    // Benchmark client format:
+    // [0]    : transaction kind (1 for standard transactions)
+    // [1..9] : transaction id (u64, big-endian)
+    // [9]    : synthetic state key to simulate conflicts
+    if tx.len() < 10 || tx[0] != 1u8 {
+        return None;
+    }
+
+    let mut id_bytes = [0u8; 8];
+    id_bytes.copy_from_slice(&tx[1..9]);
+    let tx_id = u64::from_be_bytes(id_bytes);
+    let state_key = tx[9];
+    Some((tx_id, state_key))
+}
 
 /// Assemble clients transactions into batches.
 pub struct BatchMaker {
@@ -36,11 +59,13 @@ pub struct BatchMaker {
     /// The network addresses of the other workers that share our worker id.
     workers_addresses: Vec<(PublicKey, SocketAddr)>,
     /// Holds the current batch.
-    current_batch: Batch,
+    current_batch: Vec<Transaction>,
     /// Holds the size of the current batch (in bytes).
     current_batch_size: usize,
     /// A network sender to broadcast the batches to the other workers.
     network: ReliableSender,
+    /// Records the latest writer transaction id for each key.
+    last_writer: HashMap<u8, u64>,
 }
 
 impl BatchMaker {
@@ -58,9 +83,10 @@ impl BatchMaker {
                 rx_transaction,
                 tx_message,
                 workers_addresses,
-                current_batch: Batch::with_capacity(batch_size * 2),
+                current_batch: Vec::with_capacity(batch_size * 2),
                 current_batch_size: 0,
                 network: ReliableSender::new(),
+                last_writer: HashMap::new(),
             }
             .run()
             .await;
@@ -108,13 +134,28 @@ impl BatchMaker {
         let tx_ids: Vec<_> = self
             .current_batch
             .iter()
-            .filter(|tx| tx[0] == 0u8 && tx.len() > 8)
+            .filter(|tx| tx.first() == Some(&0u8) && tx.len() > 8)
             .filter_map(|tx| tx[1..9].try_into().ok())
             .collect();
 
-        // Serialize the batch.
         self.current_batch_size = 0;
-        let batch: Vec<_> = self.current_batch.drain(..).collect();
+        let transactions: Vec<_> = self.current_batch.drain(..).collect();
+
+        let mut edges = Vec::new();
+        for tx in &transactions {
+            if let Some((tx_id, state_key)) = parse_standard_transaction(tx) {
+                if let Some(&prev_tx_id) = self.last_writer.get(&state_key) {
+                    edges.push((prev_tx_id, tx_id));
+                }
+                self.last_writer.insert(state_key, tx_id);
+            }
+        }
+
+        let batch = Batch {
+            transactions,
+            edges,
+        };
+
         let message = WorkerMessage::Batch(batch);
         let serialized = bincode::serialize(&message).expect("Failed to serialize our own batch");
 

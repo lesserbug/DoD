@@ -88,7 +88,7 @@ class LocalBench:
                         address,
                         self.tx_size,
                         rate_share,
-                        [x for y in workers_addresses for _, x in y],
+                        [x for y in workers_addresses for wid, x in y if wid == id],
                     )
                     log_file = PathMaker.client_log_file(i, id)
                     self._background_run(cmd, log_file)
@@ -131,3 +131,4 @@ class LocalBench:
         except (subprocess.SubprocessError, ParseError) as e:
             self._kill_nodes()
             raise BenchError("Failed to run benchmark", e)
+

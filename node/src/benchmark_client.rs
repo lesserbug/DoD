@@ -8,6 +8,7 @@ use futures::future::join_all;
 use futures::sink::SinkExt as _;
 use log::{info, warn};
 use rand::Rng;
+use std::collections::HashSet;
 use std::net::SocketAddr;
 use tokio::net::TcpStream;
 use tokio::time::{interval, sleep, Duration, Instant};
@@ -86,24 +87,49 @@ impl Client {
         const PRECISION: u64 = 20; // Sample precision.
         const BURST_DURATION: u64 = 1000 / PRECISION;
 
-        // The transaction size must be at least 16 bytes to ensure all txs are different.
-        if self.size < 9 {
+        // At least: 1(kind) + 8(tx id) + 1(state key).
+        if self.size < 10 {
             return Err(anyhow::Error::msg(
-                "Transaction size must be at least 9 bytes",
+                "Transaction size must be at least 10 bytes for DoD Protocol",
             ));
         }
 
-        // Connect to the mempool.
-        let stream = TcpStream::connect(self.target)
-            .await
-            .context(format!("failed to connect to {}", self.target))?;
+        // Build a de-duplicated target list while preserving order.
+        let mut seen = HashSet::new();
+        let mut all_targets = Vec::new();
+        for address in std::iter::once(self.target).chain(self.nodes.iter().copied()) {
+            if seen.insert(address) {
+                all_targets.push(address);
+            }
+        }
+
+        let mut transports = Vec::new();
+        for address in all_targets {
+            match TcpStream::connect(address).await {
+                Ok(stream) => {
+                    transports.push((address, Framed::new(stream, LengthDelimitedCodec::new())));
+                }
+                Err(e) => warn!("Failed to connect to replica {}: {}", address, e),
+            }
+        }
+
+        if transports.is_empty() {
+            return Err(anyhow::Error::msg("Failed to connect to any replica"));
+        }
+
+        info!("DoD Protocol: Broadcasting to {} replicas", transports.len());
 
         // Submit all transactions.
         let burst = self.rate / PRECISION;
+        if burst == 0 {
+            return Err(anyhow::Error::msg(
+                "Transaction rate must be at least 20 tx/s",
+            ));
+        }
+
         let mut tx = BytesMut::with_capacity(self.size);
         let mut counter = 0;
-        let mut r = rand::thread_rng().gen();
-        let mut transport = Framed::new(stream, LengthDelimitedCodec::new());
+        let mut r: u64 = rand::thread_rng().gen();
         let interval = interval(Duration::from_millis(BURST_DURATION));
         tokio::pin!(interval);
 
@@ -121,16 +147,32 @@ impl Client {
 
                     tx.put_u8(0u8); // Sample txs start with 0.
                     tx.put_u64(counter); // This counter identifies the tx.
+                    tx.put_u8(0u8); // Keep a fixed-length DoD transaction layout.
                 } else {
-                    r += 1;
+                    r = r.wrapping_add(1);
                     tx.put_u8(1u8); // Standard txs start with 1.
-                    tx.put_u64(r); // Ensures all clients send different txs.
+                    tx.put_u64(r); // Unique transaction id.
+                    tx.put_u8((r % 100) as u8); // Synthetic key for conflicts.
                 };
 
                 tx.resize(self.size, 0u8);
                 let bytes = tx.split().freeze();
-                if let Err(e) = transport.send(bytes).await {
-                    warn!("Failed to send transaction: {}", e);
+
+                let mut failed = Vec::new();
+                for (i, (address, transport)) in transports.iter_mut().enumerate() {
+                    if let Err(e) = transport.send(bytes.clone()).await {
+                        warn!("Failed to broadcast transaction to {}: {}", address, e);
+                        failed.push(i);
+                    }
+                }
+
+                // Drop dead connections to avoid warning on every future transaction.
+                for i in failed.into_iter().rev() {
+                    transports.swap_remove(i);
+                }
+
+                if transports.is_empty() {
+                    warn!("All broadcast connections failed, stopping client");
                     break 'main;
                 }
             }

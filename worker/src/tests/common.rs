@@ -90,7 +90,10 @@ pub fn transaction() -> Transaction {
 
 // Fixture
 pub fn batch() -> Batch {
-    vec![transaction(), transaction()]
+    Batch {
+        transactions: vec![transaction(), transaction()],
+        edges: Vec::new(),
+    }
 }
 
 // Fixture
@@ -126,3 +129,4 @@ pub fn listener(address: SocketAddr, expected: Option<Bytes>) -> JoinHandle<()> 
         }
     })
 }
+
