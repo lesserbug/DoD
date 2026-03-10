@@ -89,8 +89,20 @@ pub fn transaction() -> Transaction {
 }
 
 // Fixture
+pub fn standard_transaction(id: u64, state_key: u8) -> Transaction {
+    let mut tx = Vec::with_capacity(100);
+    tx.push(1u8);
+    tx.extend_from_slice(&id.to_be_bytes());
+    tx.push(state_key);
+    tx.resize(100, 0u8);
+    tx
+}
+
+// Fixture
 pub fn batch() -> Batch {
     Batch {
+        author: PublicKey::default(),
+        sequence: 0,
         transactions: vec![transaction(), transaction()],
         edges: Vec::new(),
     }
@@ -98,7 +110,7 @@ pub fn batch() -> Batch {
 
 // Fixture
 pub fn serialized_batch() -> Vec<u8> {
-    let message = WorkerMessage::Batch(batch());
+    let message = WorkerMessage::LocalBatch(batch());
     bincode::serialize(&message).unwrap()
 }
 
@@ -129,4 +141,3 @@ pub fn listener(address: SocketAddr, expected: Option<Bytes>) -> JoinHandle<()> 
         }
     })
 }
-

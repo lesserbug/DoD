@@ -25,17 +25,15 @@ pub type Transaction = Vec<u8>;
 
 #[derive(Clone, serde::Serialize, serde::Deserialize, Default, Debug, PartialEq, Eq)]
 pub struct Batch {
+    pub author: PublicKey,
+    pub sequence: u64,
     pub transactions: Vec<Transaction>,
     // Local-order dependency edges: (previous_tx_id, current_tx_id).
     pub edges: Vec<(u64, u64)>,
 }
 
-fn parse_standard_transaction(tx: &[u8]) -> Option<(u64, u8)> {
-    // Benchmark client format:
-    // [0]    : transaction kind (1 for standard transactions)
-    // [1..9] : transaction id (u64, big-endian)
-    // [9]    : synthetic state key to simulate conflicts
-    if tx.len() < 10 || tx[0] != 1u8 {
+pub(crate) fn parse_transaction_id_and_state_key(tx: &[u8]) -> Option<(u64, u8)> {
+    if tx.len() < 10 {
         return None;
     }
 
@@ -46,8 +44,22 @@ fn parse_standard_transaction(tx: &[u8]) -> Option<(u64, u8)> {
     Some((tx_id, state_key))
 }
 
+pub(crate) fn parse_standard_transaction(tx: &[u8]) -> Option<(u64, u8)> {
+    // Benchmark client format:
+    // [0]    : transaction kind (1 for standard transactions)
+    // [1..9] : transaction id (u64, big-endian)
+    // [9]    : synthetic state key to simulate conflicts
+    if tx.first() != Some(&1u8) {
+        return None;
+    }
+
+    parse_transaction_id_and_state_key(tx)
+}
+
 /// Assemble clients transactions into batches.
 pub struct BatchMaker {
+    /// The public key of this authority.
+    name: PublicKey,
     /// The preferred batch size (in bytes).
     batch_size: usize,
     /// The maximum delay after which to seal the batch (in ms).
@@ -66,10 +78,13 @@ pub struct BatchMaker {
     network: ReliableSender,
     /// Records the latest writer transaction id for each key.
     last_writer: HashMap<u8, u64>,
+    /// Sequence number of the next local-order graph.
+    next_sequence: u64,
 }
 
 impl BatchMaker {
     pub fn spawn(
+        name: PublicKey,
         batch_size: usize,
         max_batch_delay: u64,
         rx_transaction: Receiver<Transaction>,
@@ -78,6 +93,7 @@ impl BatchMaker {
     ) {
         tokio::spawn(async move {
             Self {
+                name,
                 batch_size,
                 max_batch_delay,
                 rx_transaction,
@@ -87,6 +103,7 @@ impl BatchMaker {
                 current_batch_size: 0,
                 network: ReliableSender::new(),
                 last_writer: HashMap::new(),
+                next_sequence: 0,
             }
             .run()
             .await;
@@ -152,11 +169,14 @@ impl BatchMaker {
         }
 
         let batch = Batch {
+            author: self.name,
+            sequence: self.next_sequence,
             transactions,
             edges,
         };
+        self.next_sequence += 1;
 
-        let message = WorkerMessage::Batch(batch);
+        let message = WorkerMessage::LocalBatch(batch);
         let serialized = bincode::serialize(&message).expect("Failed to serialize our own batch");
 
         #[cfg(feature = "benchmark")]

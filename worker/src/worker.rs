@@ -1,5 +1,6 @@
 // Copyright(C) Facebook, Inc. and its affiliates.
 use crate::batch_maker::{Batch, BatchMaker, Transaction};
+use crate::global_orderer::GlobalOrderer;
 use crate::helper::Helper;
 use crate::primary_connector::PrimaryConnector;
 use crate::processor::{Processor, SerializedBatchMessage};
@@ -16,7 +17,7 @@ use primary::PrimaryWorkerMessage;
 use serde::{Deserialize, Serialize};
 use std::error::Error;
 use store::Store;
-use tokio::sync::mpsc::{channel, Sender};
+use tokio::sync::mpsc::{channel, Receiver as MpscReceiver, Sender};
 
 #[cfg(test)]
 #[path = "tests/worker_tests.rs"]
@@ -35,7 +36,8 @@ pub type SerializedBatchDigestMessage = Vec<u8>;
 /// The message exchanged between workers.
 #[derive(Debug, Serialize, Deserialize)]
 pub enum WorkerMessage {
-    Batch(Batch),
+    LocalBatch(Batch),
+    GlobalBatch(Batch),
     BatchRequest(Vec<Digest>, /* origin */ PublicKey),
 }
 
@@ -71,9 +73,21 @@ impl Worker {
 
         // Spawn all worker tasks.
         let (tx_primary, rx_primary) = channel(CHANNEL_CAPACITY);
+        let (tx_own_local, rx_own_local) = channel(CHANNEL_CAPACITY);
+        let (tx_workers_local, rx_workers_local) = channel(CHANNEL_CAPACITY);
+        let (tx_global, rx_global) = channel(CHANNEL_CAPACITY);
+
+        GlobalOrderer::spawn(
+            worker.name,
+            worker.committee.clone(),
+            rx_own_local,
+            rx_workers_local,
+            tx_global,
+        );
+
         worker.handle_primary_messages();
-        worker.handle_clients_transactions(tx_primary.clone());
-        worker.handle_workers_messages(tx_primary);
+        worker.handle_clients_transactions(tx_primary.clone(), tx_own_local, rx_global);
+        worker.handle_workers_messages(tx_primary, tx_workers_local);
 
         // The `PrimaryConnector` allows the worker to send messages to its primary.
         PrimaryConnector::spawn(
@@ -135,10 +149,14 @@ impl Worker {
     }
 
     /// Spawn all tasks responsible to handle clients transactions.
-    fn handle_clients_transactions(&self, tx_primary: Sender<SerializedBatchDigestMessage>) {
+    fn handle_clients_transactions(
+        &self,
+        tx_primary: Sender<SerializedBatchDigestMessage>,
+        tx_own_local: Sender<SerializedBatchMessage>,
+        rx_global: MpscReceiver<SerializedBatchMessage>,
+    ) {
         let (tx_batch_maker, rx_batch_maker) = channel(CHANNEL_CAPACITY);
         let (tx_quorum_waiter, rx_quorum_waiter) = channel(CHANNEL_CAPACITY);
-        let (tx_processor, rx_processor) = channel(CHANNEL_CAPACITY);
 
         // We first receive clients' transactions from the network.
         let mut address = self
@@ -152,10 +170,10 @@ impl Worker {
             /* handler */ TxReceiverHandler { tx_batch_maker },
         );
 
-        // The transactions are sent to the `BatchMaker` that assembles them into batches. It then broadcasts
-        // (in a reliable manner) the batches to all other workers that share the same `id` as us. Finally, it
-        // gathers the 'cancel handlers' of the messages and send them to the `QuorumWaiter`.
+        // The transactions are sent to the `BatchMaker` that assembles them into local-order graphs. It then
+        // broadcasts these local graphs to all workers with the same `id`.
         BatchMaker::spawn(
+            self.name,
             self.parameters.batch_size,
             self.parameters.max_batch_delay,
             /* rx_transaction */ rx_batch_maker,
@@ -168,21 +186,19 @@ impl Worker {
                 .collect(),
         );
 
-        // The `QuorumWaiter` waits for 2f authorities to acknowledge reception of the batch. It then forwards
-        // the batch to the `Processor`.
+        // The `QuorumWaiter` waits for 2f authorities to acknowledge reception of our local graph.
         QuorumWaiter::spawn(
             self.committee.clone(),
             /* stake */ self.committee.stake(&self.name),
             /* rx_message */ rx_quorum_waiter,
-            /* tx_batch */ tx_processor,
+            /* tx_batch */ tx_own_local,
         );
 
-        // The `Processor` hashes and stores the batch. It then forwards the batch's digest to the `PrimaryConnector`
-        // that will send it to our primary machine.
+        // The `Processor` hashes and stores global-order graphs produced by `GlobalOrderer`.
         Processor::spawn(
             self.id,
             self.store.clone(),
-            /* rx_batch */ rx_processor,
+            /* rx_batch */ rx_global,
             /* tx_digest */ tx_primary,
             /* own_batch */ true,
         );
@@ -194,7 +210,11 @@ impl Worker {
     }
 
     /// Spawn all tasks responsible to handle messages from other workers.
-    fn handle_workers_messages(&self, tx_primary: Sender<SerializedBatchDigestMessage>) {
+    fn handle_workers_messages(
+        &self,
+        tx_primary: Sender<SerializedBatchDigestMessage>,
+        tx_workers_local: Sender<SerializedBatchMessage>,
+    ) {
         let (tx_helper, rx_helper) = channel(CHANNEL_CAPACITY);
         let (tx_processor, rx_processor) = channel(CHANNEL_CAPACITY);
 
@@ -211,6 +231,7 @@ impl Worker {
             WorkerReceiverHandler {
                 tx_helper,
                 tx_processor,
+                tx_workers_local,
             },
         );
 
@@ -222,8 +243,7 @@ impl Worker {
             /* rx_request */ rx_helper,
         );
 
-        // This `Processor` hashes and stores the batches we receive from the other workers. It then forwards the
-        // batch's digest to the `PrimaryConnector` that will send it to our primary.
+        // This `Processor` stores synchronized global-order graphs received from other workers.
         Processor::spawn(
             self.id,
             self.store.clone(),
@@ -265,6 +285,7 @@ impl MessageHandler for TxReceiverHandler {
 struct WorkerReceiverHandler {
     tx_helper: Sender<(Vec<Digest>, PublicKey)>,
     tx_processor: Sender<SerializedBatchMessage>,
+    tx_workers_local: Sender<SerializedBatchMessage>,
 }
 
 #[async_trait]
@@ -275,11 +296,18 @@ impl MessageHandler for WorkerReceiverHandler {
 
         // Deserialize and parse the message.
         match bincode::deserialize(&serialized) {
-            Ok(WorkerMessage::Batch(..)) => self
-                .tx_processor
-                .send(serialized.to_vec())
-                .await
-                .expect("Failed to send batch"),
+            Ok(WorkerMessage::LocalBatch(..)) => {
+                self.tx_workers_local
+                    .send(serialized.to_vec())
+                    .await
+                    .expect("Failed to send local graph");
+            }
+            Ok(WorkerMessage::GlobalBatch(..)) => {
+                self.tx_processor
+                    .send(serialized.to_vec())
+                    .await
+                    .expect("Failed to send global graph");
+            }
             Ok(WorkerMessage::BatchRequest(missing, requestor)) => self
                 .tx_helper
                 .send((missing, requestor))

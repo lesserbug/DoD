@@ -20,6 +20,7 @@ async fn make_batch() {
 
     // Spawn a `BatchMaker` instance.
     BatchMaker::spawn(
+        PublicKey::default(),
         /* max_batch_size */ 200,
         /* max_batch_delay */ 1_000_000, // Ensure the timer is not triggered.
         rx_transaction,
@@ -33,12 +34,14 @@ async fn make_batch() {
 
     // Ensure the batch is as expected.
     let expected_batch = Batch {
+        author: PublicKey::default(),
+        sequence: 0,
         transactions: vec![transaction(), transaction()],
         edges: Vec::new(),
     };
     let QuorumWaiterMessage { batch, handlers: _ } = rx_message.recv().await.unwrap();
     match bincode::deserialize(&batch).unwrap() {
-        WorkerMessage::Batch(batch) => assert_eq!(batch, expected_batch),
+        WorkerMessage::LocalBatch(batch) => assert_eq!(batch, expected_batch),
         _ => panic!("Unexpected message"),
     }
 }
@@ -51,6 +54,7 @@ async fn batch_timeout() {
 
     // Spawn a `BatchMaker` instance.
     BatchMaker::spawn(
+        PublicKey::default(),
         /* max_batch_size */ 200,
         /* max_batch_delay */ 50, // Ensure the timer is triggered.
         rx_transaction,
@@ -63,12 +67,14 @@ async fn batch_timeout() {
 
     // Ensure the batch is as expected.
     let expected_batch = Batch {
+        author: PublicKey::default(),
+        sequence: 0,
         transactions: vec![transaction()],
         edges: Vec::new(),
     };
     let QuorumWaiterMessage { batch, handlers: _ } = rx_message.recv().await.unwrap();
     match bincode::deserialize(&batch).unwrap() {
-        WorkerMessage::Batch(batch) => assert_eq!(batch, expected_batch),
+        WorkerMessage::LocalBatch(batch) => assert_eq!(batch, expected_batch),
         _ => panic!("Unexpected message"),
     }
 }
@@ -80,6 +86,7 @@ async fn local_order_adds_edge_for_conflicting_txs_in_same_batch() {
     let dummy_addresses = vec![(PublicKey::default(), "127.0.0.1:0".parse().unwrap())];
 
     BatchMaker::spawn(
+        PublicKey::default(),
         /* max_batch_size */ 200,
         /* max_batch_delay */ 1_000_000,
         rx_transaction,
@@ -87,12 +94,19 @@ async fn local_order_adds_edge_for_conflicting_txs_in_same_batch() {
         dummy_addresses,
     );
 
-    tx_transaction.send(standard_transaction(10, 7)).await.unwrap();
-    tx_transaction.send(standard_transaction(11, 7)).await.unwrap();
+    tx_transaction
+        .send(standard_transaction(10, 7))
+        .await
+        .unwrap();
+    tx_transaction
+        .send(standard_transaction(11, 7))
+        .await
+        .unwrap();
 
     let QuorumWaiterMessage { batch, handlers: _ } = rx_message.recv().await.unwrap();
     match bincode::deserialize(&batch).unwrap() {
-        WorkerMessage::Batch(batch) => {
+        WorkerMessage::LocalBatch(batch) => {
+            assert_eq!(batch.sequence, 0);
             assert_eq!(batch.edges, vec![(10, 11)]);
         }
         _ => panic!("Unexpected message"),
@@ -106,6 +120,7 @@ async fn local_order_persists_across_batches() {
     let dummy_addresses = vec![(PublicKey::default(), "127.0.0.1:0".parse().unwrap())];
 
     BatchMaker::spawn(
+        PublicKey::default(),
         /* max_batch_size */ 100,
         /* max_batch_delay */ 1_000_000,
         rx_transaction,
@@ -113,23 +128,33 @@ async fn local_order_persists_across_batches() {
         dummy_addresses,
     );
 
-    tx_transaction.send(standard_transaction(42, 9)).await.unwrap();
+    tx_transaction
+        .send(standard_transaction(42, 9))
+        .await
+        .unwrap();
     let QuorumWaiterMessage {
         batch: first_batch,
         handlers: _,
     } = rx_message.recv().await.unwrap();
     match bincode::deserialize(&first_batch).unwrap() {
-        WorkerMessage::Batch(batch) => assert!(batch.edges.is_empty()),
+        WorkerMessage::LocalBatch(batch) => {
+            assert_eq!(batch.sequence, 0);
+            assert!(batch.edges.is_empty());
+        }
         _ => panic!("Unexpected message"),
     }
 
-    tx_transaction.send(standard_transaction(43, 9)).await.unwrap();
+    tx_transaction
+        .send(standard_transaction(43, 9))
+        .await
+        .unwrap();
     let QuorumWaiterMessage {
         batch: second_batch,
         handlers: _,
     } = rx_message.recv().await.unwrap();
     match bincode::deserialize(&second_batch).unwrap() {
-        WorkerMessage::Batch(batch) => {
+        WorkerMessage::LocalBatch(batch) => {
+            assert_eq!(batch.sequence, 1);
             assert_eq!(batch.edges, vec![(42, 43)]);
         }
         _ => panic!("Unexpected message"),
