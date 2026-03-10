@@ -12,6 +12,20 @@ fn standard_transaction(id: u64, state_key: u8) -> Transaction {
     tx
 }
 
+fn legacy_sample_transaction(id: u64) -> Transaction {
+    let mut tx = Vec::with_capacity(9);
+    tx.push(0u8);
+    tx.extend_from_slice(&id.to_be_bytes());
+    tx
+}
+
+#[test]
+fn parses_legacy_sample_transaction_layout() {
+    let tx = legacy_sample_transaction(42);
+    assert_eq!(parse_transaction_id_and_state_key(&tx), Some((42, 0u8)));
+    assert_eq!(parse_standard_transaction(&tx), None);
+}
+
 #[tokio::test]
 async fn make_batch() {
     let (tx_transaction, rx_transaction) = channel(1);

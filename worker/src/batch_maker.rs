@@ -33,14 +33,17 @@ pub struct Batch {
 }
 
 pub(crate) fn parse_transaction_id_and_state_key(tx: &[u8]) -> Option<(u64, u8)> {
-    if tx.len() < 10 {
+    // We accept both DoD benchmark transaction layouts:
+    //  - sample   : [kind=0][tx_id:8] (legacy 9-byte prefix)
+    //  - standard : [kind=1][tx_id:8][state_key:1]
+    if tx.len() < 9 {
         return None;
     }
 
     let mut id_bytes = [0u8; 8];
     id_bytes.copy_from_slice(&tx[1..9]);
     let tx_id = u64::from_be_bytes(id_bytes);
-    let state_key = tx[9];
+    let state_key = if tx.len() >= 10 { tx[9] } else { 0u8 };
     Some((tx_id, state_key))
 }
 
@@ -49,7 +52,7 @@ pub(crate) fn parse_standard_transaction(tx: &[u8]) -> Option<(u64, u8)> {
     // [0]    : transaction kind (1 for standard transactions)
     // [1..9] : transaction id (u64, big-endian)
     // [9]    : synthetic state key to simulate conflicts
-    if tx.first() != Some(&1u8) {
+    if tx.first() != Some(&1u8) || tx.len() < 10 {
         return None;
     }
 
@@ -136,7 +139,7 @@ impl BatchMaker {
                 }
             }
 
-            // Give the change to schedule other tasks.
+            // Give the chance to schedule other tasks.
             tokio::task::yield_now().await;
         }
     }
@@ -189,16 +192,16 @@ impl BatchMaker {
             );
 
             for id in tx_ids {
-                // NOTE: This log entry is used to compute performance.
+                // NOTE: Kept for debugging local-order traffic; benchmark parser ignores this prefix.
                 info!(
-                    "Batch {:?} contains sample tx {}",
+                    "LocalGraph {:?} contains sample tx {}",
                     digest,
                     u64::from_be_bytes(id)
                 );
             }
 
-            // NOTE: This log entry is used to compute performance.
-            info!("Batch {:?} contains {} B", digest, size);
+            // NOTE: Kept for debugging local-order traffic; benchmark parser ignores this prefix.
+            info!("LocalGraph {:?} contains {} B", digest, size);
         }
 
         // Broadcast the batch through the network.

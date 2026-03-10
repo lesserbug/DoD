@@ -83,6 +83,12 @@ impl Worker {
             rx_own_local,
             rx_workers_local,
             tx_global,
+            worker
+                .committee
+                .others_workers(&worker.name, &worker.id)
+                .iter()
+                .map(|(name, addresses)| (*name, addresses.worker_to_worker))
+                .collect(),
         );
 
         worker.handle_primary_messages();

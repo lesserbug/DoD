@@ -2,10 +2,13 @@
 use crate::batch_maker::{parse_transaction_id_and_state_key, Batch, Transaction};
 use crate::processor::SerializedBatchMessage;
 use crate::worker::WorkerMessage;
+use bytes::Bytes;
 use config::{Committee, Stake};
 use crypto::PublicKey;
 use log::{debug, warn};
+use network::ReliableSender;
 use std::collections::{BTreeSet, HashMap, HashSet};
+use std::net::SocketAddr;
 use tokio::sync::mpsc::{Receiver, Sender};
 
 #[cfg(test)]
@@ -31,6 +34,10 @@ pub struct GlobalOrderer {
     rx_workers_local: Receiver<SerializedBatchMessage>,
     /// Outputs serialized `WorkerMessage::GlobalBatch` graphs.
     tx_global: Sender<SerializedBatchMessage>,
+    /// The network addresses of other workers sharing our worker id.
+    workers_addresses: Vec<(PublicKey, SocketAddr)>,
+    /// A network sender to disseminate global-order graphs.
+    network: ReliableSender,
     /// Per-sequence collection state.
     sequences: HashMap<u64, SequenceState>,
     /// Finalized sequences are ignored if duplicated later.
@@ -44,6 +51,7 @@ impl GlobalOrderer {
         rx_own_local: Receiver<SerializedBatchMessage>,
         rx_workers_local: Receiver<SerializedBatchMessage>,
         tx_global: Sender<SerializedBatchMessage>,
+        workers_addresses: Vec<(PublicKey, SocketAddr)>,
     ) {
         tokio::spawn(async move {
             Self {
@@ -52,6 +60,8 @@ impl GlobalOrderer {
                 rx_own_local,
                 rx_workers_local,
                 tx_global,
+                workers_addresses,
+                network: ReliableSender::new(),
                 sequences: HashMap::new(),
                 finalized: HashSet::new(),
             }
@@ -147,6 +157,16 @@ impl GlobalOrderer {
             let serialized = bincode::serialize(&message)
                 .expect("Failed to serialize global-order graph as worker message");
 
+            // Disseminate the global-order graph to peer workers.
+            let addresses: Vec<_> = self
+                .workers_addresses
+                .iter()
+                .map(|(_, address)| *address)
+                .collect();
+            let bytes = Bytes::from(serialized.clone());
+            let _ = self.network.broadcast(addresses, bytes).await;
+
+            // Deliver locally for hashing/storage and primary notification.
             self.tx_global
                 .send(serialized)
                 .await
