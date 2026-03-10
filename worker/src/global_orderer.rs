@@ -151,8 +151,14 @@ impl GlobalOrderer {
         }
 
         if let Some(graphs) = graphs_to_finalize {
-            let graph_refs: Vec<_> = graphs.iter().collect();
-            let global_batch = self.build_global_batch(batch.sequence, graph_refs);
+            let sequence = batch.sequence;
+            let name = self.name;
+            let committee = self.committee.clone();
+            let global_batch = tokio::task::spawn_blocking(move || {
+                Self::build_global_batch(name, committee, sequence, graphs)
+            })
+            .await
+            .expect("Global orderer task panicked while building global-order graph");
             let message = WorkerMessage::GlobalBatch(global_batch);
             let serialized = bincode::serialize(&message)
                 .expect("Failed to serialize global-order graph as worker message");
@@ -172,22 +178,27 @@ impl GlobalOrderer {
                 .await
                 .expect("Failed to send global-order graph");
 
-            self.finalized.insert(batch.sequence);
-            self.sequences.remove(&batch.sequence);
-            debug!("Global order finalized for sequence {}", batch.sequence);
+            self.finalized.insert(sequence);
+            self.sequences.remove(&sequence);
+            debug!("Global order finalized for sequence {}", sequence);
         }
     }
 
-    fn build_global_batch(&self, sequence: u64, local_graphs: Vec<&Batch>) -> Batch {
-        let quorum = self.committee.quorum_threshold();
-        let validity = self.committee.validity_threshold();
+    fn build_global_batch(
+        name: PublicKey,
+        committee: Committee,
+        sequence: u64,
+        local_graphs: Vec<Batch>,
+    ) -> Batch {
+        let quorum = committee.quorum_threshold();
+        let validity = committee.validity_threshold();
 
         let mut support: HashMap<u64, Stake> = HashMap::new();
         let mut canonical_tx: HashMap<u64, Transaction> = HashMap::new();
         let mut state_key: HashMap<u64, u8> = HashMap::new();
 
         for graph in &local_graphs {
-            let stake = self.committee.stake(&graph.author);
+            let stake = committee.stake(&graph.author);
             let mut seen = HashSet::new();
             for tx in &graph.transactions {
                 if let Some((tx_id, key)) = parse_transaction_id_and_state_key(tx) {
@@ -256,7 +267,7 @@ impl GlobalOrderer {
         // Remove edges from pending transactions to fixed transactions.
         edges.retain(|(from, to)| !(pending_txs.contains(from) && fixed_txs.contains(to)));
 
-        self.prune_cycles(&mut nodes, &mut edges, &fixed_txs, &pending_txs, &state_key);
+        Self::prune_cycles(&mut nodes, &mut edges, &fixed_txs, &pending_txs, &state_key);
 
         let reduced_edges = Self::transitive_reduction(&nodes, &edges);
         let ordered_tx_ids = Self::topological_sort(&nodes, &reduced_edges);
@@ -273,7 +284,7 @@ impl GlobalOrderer {
         final_edges.sort_unstable();
 
         Batch {
-            author: self.name,
+            author: name,
             sequence,
             transactions,
             edges: final_edges,
@@ -281,7 +292,6 @@ impl GlobalOrderer {
     }
 
     fn prune_cycles(
-        &self,
         nodes: &mut HashSet<u64>,
         edges: &mut HashSet<(u64, u64)>,
         fixed_txs: &HashSet<u64>,
@@ -488,37 +498,53 @@ impl GlobalOrderer {
         edges: &HashSet<(u64, u64)>,
     ) -> HashSet<(u64, u64)> {
         let mut reduced = edges.clone();
+        let mut adjacency = Self::build_adjacency(nodes, &reduced);
         let mut ordered_edges: Vec<_> = edges.iter().copied().collect();
         ordered_edges.sort_unstable();
 
         for (from, to) in ordered_edges {
-            reduced.remove(&(from, to));
-            if !Self::has_path(from, to, nodes, &reduced) {
+            if !reduced.remove(&(from, to)) {
+                continue;
+            }
+
+            let mut remove_entry = false;
+            if let Some(neighbors) = adjacency.get_mut(&from) {
+                neighbors.remove(&to);
+                remove_entry = neighbors.is_empty();
+            }
+            if remove_entry {
+                adjacency.remove(&from);
+            }
+
+            if !Self::has_path_in_adjacency(from, to, &adjacency) {
                 reduced.insert((from, to));
+                adjacency.entry(from).or_default().insert(to);
             }
         }
 
         reduced
     }
 
-    fn has_path(
-        start: u64,
-        target: u64,
+    fn build_adjacency(
         nodes: &HashSet<u64>,
         edges: &HashSet<(u64, u64)>,
+    ) -> HashMap<u64, BTreeSet<u64>> {
+        let mut adjacency: HashMap<u64, BTreeSet<u64>> = HashMap::new();
+        for &(from, to) in edges {
+            if nodes.contains(&from) && nodes.contains(&to) {
+                adjacency.entry(from).or_default().insert(to);
+            }
+        }
+        adjacency
+    }
+
+    fn has_path_in_adjacency(
+        start: u64,
+        target: u64,
+        adjacency: &HashMap<u64, BTreeSet<u64>>,
     ) -> bool {
         if start == target {
             return true;
-        }
-
-        let mut adjacency: HashMap<u64, Vec<u64>> = HashMap::new();
-        for &(from, to) in edges {
-            if nodes.contains(&from) && nodes.contains(&to) {
-                adjacency.entry(from).or_default().push(to);
-            }
-        }
-        for neighbors in adjacency.values_mut() {
-            neighbors.sort_unstable();
         }
 
         let mut visited = HashSet::new();
