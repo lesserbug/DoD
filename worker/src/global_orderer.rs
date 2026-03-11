@@ -5,6 +5,8 @@ use crate::worker::WorkerMessage;
 use bytes::Bytes;
 use config::{Committee, Stake};
 use crypto::PublicKey;
+use futures::stream::futures_unordered::FuturesUnordered;
+use futures::stream::StreamExt as _;
 use log::{debug, warn};
 use network::ReliableSender;
 use std::collections::{BTreeSet, HashMap, HashSet};
@@ -164,13 +166,45 @@ impl GlobalOrderer {
                 .expect("Failed to serialize global-order graph as worker message");
 
             // Disseminate the global-order graph to peer workers.
-            let addresses: Vec<_> = self
-                .workers_addresses
-                .iter()
-                .map(|(_, address)| *address)
-                .collect();
+            let (names, addresses): (Vec<_>, Vec<_>) =
+                self.workers_addresses.iter().cloned().unzip();
             let bytes = Bytes::from(serialized.clone());
-            let _ = self.network.broadcast(addresses, bytes).await;
+            let handlers = self.network.broadcast(addresses, bytes).await;
+
+            // Mimic Narwhal's batch path: only forward to primary once n-f workers acknowledged.
+            let reached_quorum = if cfg!(test) || names.is_empty() {
+                // Unit tests may run without a network topology.
+                true
+            } else {
+                let mut wait_for_quorum: FuturesUnordered<_> = names
+                    .into_iter()
+                    .zip(handlers.into_iter())
+                    .map(|(name, handler)| {
+                        let stake = self.committee.stake(&name);
+                        async move {
+                            let _ = handler.await;
+                            stake
+                        }
+                    })
+                    .collect();
+
+                let mut total_stake = self.committee.stake(&self.name);
+                let quorum = self.committee.quorum_threshold();
+                while let Some(stake) = wait_for_quorum.next().await {
+                    total_stake += stake;
+                    if total_stake >= quorum {
+                        break;
+                    }
+                }
+                total_stake >= quorum
+            };
+            if !reached_quorum {
+                warn!(
+                    "Global graph sequence {} did not reach quorum acknowledgements",
+                    sequence
+                );
+                return;
+            }
 
             // Deliver locally for hashing/storage and primary notification.
             self.tx_global
