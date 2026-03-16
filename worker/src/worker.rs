@@ -70,13 +70,8 @@ impl Worker {
             parameters,
             store,
         };
-        let benchmark_canonical = worker
-            .committee
-            .authorities
-            .keys()
-            .min()
-            .copied()
-            == Some(worker.name);
+        let benchmark_canonical =
+            worker.committee.authorities.keys().min().copied() == Some(worker.name);
 
         // Spawn all worker tasks.
         let (tx_primary, rx_primary) = channel(CHANNEL_CAPACITY);

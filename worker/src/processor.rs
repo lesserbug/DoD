@@ -39,6 +39,9 @@ impl Processor {
         benchmark_log_batches: bool,
     ) {
         tokio::spawn(async move {
+            #[cfg(not(feature = "benchmark"))]
+            let _ = benchmark_log_batches;
+
             while let Some(batch) = rx_batch.recv().await {
                 // Hash the batch.
                 let digest = Digest(Sha512::digest(&batch).as_slice()[..32].try_into().unwrap());

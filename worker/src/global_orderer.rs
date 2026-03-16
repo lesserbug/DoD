@@ -14,6 +14,7 @@ use network::ReliableSender;
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::net::SocketAddr;
 use tokio::sync::mpsc::{Receiver, Sender};
+use tokio::time::{Duration, Instant};
 
 #[cfg(test)]
 #[path = "tests/global_orderer_tests.rs"]
@@ -24,6 +25,7 @@ struct SequenceState {
     own_received: bool,
     collected_stake: Stake,
     local_graphs: HashMap<PublicKey, Batch>,
+    quorum_reached_at: Option<Instant>,
 }
 
 /// Collects local-order graphs and produces a global-order graph (DoD Algorithm 2).
@@ -49,6 +51,10 @@ pub struct GlobalOrderer {
 }
 
 impl GlobalOrderer {
+    const STABILIZATION_DELAY_MS: u64 = 10;
+    const ORDER_FAIRNESS_GAMMA_NUM: Stake = 1;
+    const ORDER_FAIRNESS_GAMMA_DEN: Stake = 1;
+
     pub fn spawn(
         name: PublicKey,
         committee: Committee,
@@ -75,6 +81,9 @@ impl GlobalOrderer {
     }
 
     async fn run(&mut self) {
+        let mut stabilization_tick =
+            tokio::time::interval(Duration::from_millis(Self::STABILIZATION_DELAY_MS));
+
         loop {
             tokio::select! {
                 Some(serialized) = self.rx_own_local.recv() => {
@@ -83,10 +92,13 @@ impl GlobalOrderer {
                 Some(serialized) = self.rx_workers_local.recv() => {
                     self.handle_local_graph(serialized, false).await;
                 }
+                _ = stabilization_tick.tick() => {}
                 else => {
                     break;
                 }
             }
+
+            self.try_finalize_ready_sequences().await;
         }
     }
 
@@ -131,93 +143,157 @@ impl GlobalOrderer {
             return;
         }
 
-        let mut graphs_to_finalize = None;
+        let quorum = self.committee.quorum_threshold();
+        let entry = self
+            .sequences
+            .entry(batch.sequence)
+            .or_insert_with(SequenceState::default);
+
+        let is_new_author = !entry.local_graphs.contains_key(&batch.author);
+        if is_new_author {
+            entry.collected_stake += author_stake;
+            entry.local_graphs.insert(batch.author, batch);
+        }
+
+        if from_our_quorum {
+            entry.own_received = true;
+        }
+
+        if entry.own_received
+            && entry.collected_stake >= quorum
+            && entry.quorum_reached_at.is_none()
         {
-            let entry = self
-                .sequences
-                .entry(batch.sequence)
-                .or_insert_with(SequenceState::default);
-
-            let is_new_author = !entry.local_graphs.contains_key(&batch.author);
-            if is_new_author {
-                entry.collected_stake += author_stake;
-                entry.local_graphs.insert(batch.author, batch.clone());
-            }
-
-            if from_our_quorum {
-                entry.own_received = true;
-            }
-
-            let quorum = self.committee.quorum_threshold();
-            if entry.own_received && entry.collected_stake >= quorum {
-                graphs_to_finalize = Some(entry.local_graphs.values().cloned().collect::<Vec<_>>());
-            }
+            entry.quorum_reached_at = Some(Instant::now());
         }
+    }
 
-        if let Some(graphs) = graphs_to_finalize {
-            let sequence = batch.sequence;
-            let name = self.name;
-            let committee = self.committee.clone();
-            let global_batch = tokio::task::spawn_blocking(move || {
-                Self::build_global_batch(name, committee, sequence, graphs)
-            })
-            .await
-            .expect("Global orderer task panicked while building global-order graph");
-            let message = WorkerMessage::GlobalBatch(global_batch);
-            let serialized = bincode::serialize(&message)
-                .expect("Failed to serialize global-order graph as worker message");
-
-            // Disseminate the global-order graph to peer workers.
-            let (names, addresses): (Vec<_>, Vec<_>) =
-                self.workers_addresses.iter().cloned().unzip();
-            let bytes = Bytes::from(serialized.clone());
-            let handlers = self.network.broadcast(addresses, bytes).await;
-
-            // Mimic Narwhal's batch path: only forward to primary once n-f workers acknowledged.
-            let reached_quorum = if cfg!(test) || names.is_empty() {
-                // Unit tests may run without a network topology.
-                true
-            } else {
-                let mut wait_for_quorum: FuturesUnordered<_> = names
-                    .into_iter()
-                    .zip(handlers.into_iter())
-                    .map(|(name, handler)| {
-                        let stake = self.committee.stake(&name);
-                        async move {
-                            let _ = handler.await;
-                            stake
-                        }
-                    })
-                    .collect();
-
-                let mut total_stake = self.committee.stake(&self.name);
-                let quorum = self.committee.quorum_threshold();
-                while let Some(stake) = wait_for_quorum.next().await {
-                    total_stake += stake;
-                    if total_stake >= quorum {
-                        break;
-                    }
-                }
-                total_stake >= quorum
+    async fn try_finalize_ready_sequences(&mut self) {
+        let ready_sequences = self.ready_sequences(Instant::now());
+        for sequence in ready_sequences {
+            let graphs = match self.sequences.get(&sequence) {
+                Some(state) => Self::select_quorum_graphs(&self.committee, &state.local_graphs),
+                None => continue,
             };
-            if !reached_quorum {
-                warn!(
-                    "Global graph sequence {} did not reach quorum acknowledgements",
-                    sequence
-                );
-                return;
+
+            if graphs.is_empty() {
+                continue;
             }
 
-            // Deliver locally for hashing/storage and primary notification.
-            self.tx_global
-                .send(serialized)
-                .await
-                .expect("Failed to send global-order graph");
-
-            self.finalized.insert(sequence);
-            self.sequences.remove(&sequence);
-            debug!("Global order finalized for sequence {}", sequence);
+            if self.finalize_sequence(sequence, graphs).await {
+                self.finalized.insert(sequence);
+                self.sequences.remove(&sequence);
+                debug!("Global order finalized for sequence {}", sequence);
+            }
         }
+    }
+
+    fn ready_sequences(&self, now: Instant) -> Vec<u64> {
+        let delay = Duration::from_millis(Self::STABILIZATION_DELAY_MS);
+        let quorum = self.committee.quorum_threshold();
+        let mut ready = Vec::new();
+
+        for (&sequence, state) in &self.sequences {
+            if self.finalized.contains(&sequence)
+                || !state.own_received
+                || state.collected_stake < quorum
+            {
+                continue;
+            }
+
+            if let Some(reached_at) = state.quorum_reached_at {
+                if now.duration_since(reached_at) >= delay {
+                    ready.push(sequence);
+                }
+            }
+        }
+
+        ready.sort_unstable();
+        ready
+    }
+
+    fn select_quorum_graphs(
+        committee: &Committee,
+        local_graphs: &HashMap<PublicKey, Batch>,
+    ) -> Vec<Batch> {
+        let mut sorted_graphs: Vec<_> = local_graphs
+            .iter()
+            .map(|(author, batch)| (*author, batch.clone()))
+            .collect();
+        sorted_graphs.sort_unstable_by_key(|(author, _)| *author);
+
+        let quorum = committee.quorum_threshold();
+        let mut selected = Vec::new();
+        let mut total_stake = 0;
+        for (author, batch) in sorted_graphs {
+            total_stake += committee.stake(&author);
+            selected.push(batch);
+            if total_stake >= quorum {
+                return selected;
+            }
+        }
+
+        Vec::new()
+    }
+
+    async fn finalize_sequence(&mut self, sequence: u64, graphs: Vec<Batch>) -> bool {
+        let name = self.name;
+        let committee = self.committee.clone();
+        let global_batch = tokio::task::spawn_blocking(move || {
+            Self::build_global_batch(name, committee, sequence, graphs)
+        })
+        .await
+        .expect("Global orderer task panicked while building global-order graph");
+        let message = WorkerMessage::GlobalBatch(global_batch);
+        let serialized = bincode::serialize(&message)
+            .expect("Failed to serialize global-order graph as worker message");
+
+        // Disseminate the global-order graph to peer workers.
+        let (names, addresses): (Vec<_>, Vec<_>) = self.workers_addresses.iter().cloned().unzip();
+        let bytes = Bytes::from(serialized.clone());
+        let handlers = self.network.broadcast(addresses, bytes).await;
+
+        // Mimic Narwhal's batch path: only forward to primary once n-f workers acknowledged.
+        let reached_quorum = if cfg!(test) || names.is_empty() {
+            // Unit tests may run without a network topology.
+            true
+        } else {
+            let mut wait_for_quorum: FuturesUnordered<_> = names
+                .into_iter()
+                .zip(handlers.into_iter())
+                .map(|(name, handler)| {
+                    let stake = self.committee.stake(&name);
+                    async move {
+                        let _ = handler.await;
+                        stake
+                    }
+                })
+                .collect();
+
+            let mut total_stake = self.committee.stake(&self.name);
+            let quorum = self.committee.quorum_threshold();
+            while let Some(stake) = wait_for_quorum.next().await {
+                total_stake += stake;
+                if total_stake >= quorum {
+                    break;
+                }
+            }
+            total_stake >= quorum
+        };
+        if !reached_quorum {
+            warn!(
+                "Global graph sequence {} did not reach quorum acknowledgements",
+                sequence
+            );
+            return false;
+        }
+
+        // Deliver locally for hashing/storage and primary notification.
+        self.tx_global
+            .send(serialized)
+            .await
+            .expect("Failed to send global-order graph");
+
+        true
     }
 
     fn build_global_batch(
@@ -226,8 +302,8 @@ impl GlobalOrderer {
         sequence: u64,
         local_graphs: Vec<Batch>,
     ) -> Batch {
-        let quorum = committee.quorum_threshold();
-        let validity = committee.validity_threshold();
+        let fixed_threshold = Self::fixed_threshold(&committee);
+        let pending_threshold = Self::pending_threshold(&committee);
 
         let mut support: HashMap<u64, Stake> = HashMap::new();
         let mut canonical_tx: HashMap<u64, Transaction> = HashMap::new();
@@ -262,27 +338,33 @@ impl GlobalOrderer {
 
         let fixed_txs: HashSet<u64> = support
             .iter()
-            .filter_map(|(tx_id, count)| (*count >= quorum).then_some(*tx_id))
+            .filter_map(|(tx_id, count)| (*count >= fixed_threshold).then_some(*tx_id))
             .collect();
         let pending_txs: HashSet<u64> = support
             .iter()
             .filter_map(|(tx_id, count)| {
-                (*count >= validity && *count < quorum).then_some(*tx_id)
+                (*count >= pending_threshold && *count < fixed_threshold).then_some(*tx_id)
             })
             .collect();
 
         let mut nodes: HashSet<u64> = support
             .iter()
-            .filter_map(|(tx_id, count)| (*count >= validity).then_some(*tx_id))
+            .filter_map(|(tx_id, count)| (*count >= pending_threshold).then_some(*tx_id))
             .collect();
 
-        let mut edges =
-            Self::build_weighted_edges(&committee, &local_graphs, &nodes, &state_key, validity);
+        let mut edges = Self::build_weighted_edges(
+            &committee,
+            &local_graphs,
+            &nodes,
+            &state_key,
+            pending_threshold,
+        );
         Self::retain_sccs_with_path_to_fixed(&mut nodes, &mut edges, &fixed_txs, &pending_txs);
 
         let sccs = Self::tarjan_scc(&nodes, &edges);
         let component_index = Self::component_index(&sccs);
-        let missing_edges = Self::collect_missing_edges(&nodes, &edges, &component_index, &state_key);
+        let missing_edges =
+            Self::collect_missing_edges(&nodes, &edges, &component_index, &state_key);
         Self::linearize_sccs(&mut edges, &sccs);
 
         let reduced_edges = Self::transitive_reduction(&nodes, &edges);
@@ -311,6 +393,29 @@ impl GlobalOrderer {
             edges: final_edges,
             missing_edges: final_missing_edges,
         }
+    }
+
+    fn tolerated_faults(committee: &Committee) -> Stake {
+        ((committee.size().saturating_sub(1)) / 3) as Stake
+    }
+
+    fn fixed_threshold(committee: &Committee) -> Stake {
+        let replicas = committee.size() as Stake;
+        let faults = Self::tolerated_faults(committee);
+        replicas.saturating_sub(2 * faults).max(1)
+    }
+
+    fn pending_threshold(committee: &Committee) -> Stake {
+        let replicas = committee.size() as Stake;
+        let faults = Self::tolerated_faults(committee);
+        let gamma_num = Self::ORDER_FAIRNESS_GAMMA_NUM.min(Self::ORDER_FAIRNESS_GAMMA_DEN);
+        let gamma_den = Self::ORDER_FAIRNESS_GAMMA_DEN.max(1);
+        let floor_n_times_one_minus_gamma =
+            replicas.saturating_mul(gamma_den - gamma_num) / gamma_den;
+        floor_n_times_one_minus_gamma
+            .saturating_add(faults)
+            .saturating_add(1)
+            .max(1)
     }
 
     fn build_weighted_edges(
@@ -413,7 +518,8 @@ impl GlobalOrderer {
         while let Some(component) = stack.pop() {
             if let Some(previous) = reverse_edges.get(&component) {
                 for &candidate in previous {
-                    if pending_components.contains(&candidate) && keep_components.insert(candidate) {
+                    if pending_components.contains(&candidate) && keep_components.insert(candidate)
+                    {
                         stack.push(candidate);
                     }
                 }
@@ -477,9 +583,7 @@ impl GlobalOrderer {
             }
 
             let members: HashSet<u64> = scc.iter().copied().collect();
-            edges.retain(|(from, to)| {
-                !(members.contains(from) && members.contains(to))
-            });
+            edges.retain(|(from, to)| !(members.contains(from) && members.contains(to)));
 
             let mut ordered = scc.clone();
             ordered.sort_unstable();

@@ -2,6 +2,7 @@
 use super::*;
 use crate::batch_maker::parse_transaction_id_and_state_key;
 use crate::common::{committee_with_base_port, keys, standard_transaction};
+use std::collections::HashMap;
 use tokio::sync::mpsc::channel;
 
 fn make_local_graph(
@@ -270,4 +271,38 @@ async fn records_missing_edges_when_support_is_ambiguous() {
         }
         other => panic!("Unexpected worker message: {:?}", other),
     }
+}
+
+#[test]
+fn selects_a_deterministic_quorum_subset() {
+    let committee = committee_with_base_port(14_500);
+    let mut authors: Vec<_> = committee.authorities.keys().copied().collect();
+    authors.sort_unstable();
+
+    let local_graphs: HashMap<_, _> = authors
+        .iter()
+        .enumerate()
+        .rev()
+        .map(|(index, author)| {
+            (
+                *author,
+                Batch {
+                    author: *author,
+                    sequence: 7,
+                    transactions: vec![standard_transaction(100 + index as u64, 1)],
+                    edges: Vec::new(),
+                    missing_edges: Vec::new(),
+                },
+            )
+        })
+        .collect();
+
+    let selected = GlobalOrderer::select_quorum_graphs(&committee, &local_graphs);
+    let selected_authors: Vec<_> = selected.iter().map(|batch| batch.author).collect();
+
+    assert_eq!(selected.len(), committee.quorum_threshold() as usize);
+    assert_eq!(
+        selected_authors,
+        authors[..committee.quorum_threshold() as usize].to_vec()
+    );
 }

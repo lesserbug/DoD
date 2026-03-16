@@ -129,7 +129,10 @@ impl Client {
             return Err(anyhow::Error::msg("Failed to connect to any replica"));
         }
 
-        info!("DoD Protocol: Broadcasting to {} replicas", transports.len());
+        info!(
+            "DoD Protocol: Broadcasting to {} replicas",
+            transports.len()
+        );
 
         // Submit all transactions.
         let burst = self.rate / PRECISION;
