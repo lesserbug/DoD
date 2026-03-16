@@ -29,6 +29,8 @@ pub struct Batch {
     pub sequence: u64,
     pub transactions: Vec<Transaction>,
     // Local-order dependency edges: (previous_tx_id, current_tx_id).
+    // We keep every earlier conflicting transaction, letting later global
+    // pruning remove redundant edges.
     pub edges: Vec<(u64, u64)>,
 }
 
@@ -79,8 +81,9 @@ pub struct BatchMaker {
     current_batch_size: usize,
     /// A network sender to broadcast the batches to the other workers.
     network: ReliableSender,
-    /// Records the latest writer transaction id for each key.
-    last_writer: HashMap<u8, u64>,
+    /// Records all prior transaction ids seen for each key so local-order
+    /// graphs can connect a new transaction to every earlier dependency.
+    writers_by_key: HashMap<u8, Vec<u64>>,
     /// Sequence number of the next local-order graph.
     next_sequence: u64,
 }
@@ -105,7 +108,7 @@ impl BatchMaker {
                 current_batch: Vec::with_capacity(batch_size * 2),
                 current_batch_size: 0,
                 network: ReliableSender::new(),
-                last_writer: HashMap::new(),
+                writers_by_key: HashMap::new(),
                 next_sequence: 0,
             }
             .run()
@@ -164,10 +167,16 @@ impl BatchMaker {
         let mut edges = Vec::new();
         for tx in &transactions {
             if let Some((tx_id, state_key)) = parse_standard_transaction(tx) {
-                if let Some(&prev_tx_id) = self.last_writer.get(&state_key) {
-                    edges.push((prev_tx_id, tx_id));
+                let prior_writers = self.writers_by_key.entry(state_key).or_default();
+                for &prev_tx_id in prior_writers.iter() {
+                    if prev_tx_id != tx_id {
+                        edges.push((prev_tx_id, tx_id));
+                    }
                 }
-                self.last_writer.insert(state_key, tx_id);
+
+                if !prior_writers.contains(&tx_id) {
+                    prior_writers.push(tx_id);
+                }
             }
         }
 

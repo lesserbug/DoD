@@ -128,6 +128,44 @@ async fn local_order_adds_edge_for_conflicting_txs_in_same_batch() {
 }
 
 #[tokio::test]
+async fn local_order_links_to_all_prior_conflicting_txs() {
+    let (tx_transaction, rx_transaction) = channel(3);
+    let (tx_message, mut rx_message) = channel(1);
+    let dummy_addresses = vec![(PublicKey::default(), "127.0.0.1:0".parse().unwrap())];
+
+    BatchMaker::spawn(
+        PublicKey::default(),
+        /* max_batch_size */ 300,
+        /* max_batch_delay */ 1_000_000,
+        rx_transaction,
+        tx_message,
+        dummy_addresses,
+    );
+
+    tx_transaction
+        .send(standard_transaction(10, 7))
+        .await
+        .unwrap();
+    tx_transaction
+        .send(standard_transaction(11, 7))
+        .await
+        .unwrap();
+    tx_transaction
+        .send(standard_transaction(12, 7))
+        .await
+        .unwrap();
+
+    let QuorumWaiterMessage { batch, handlers: _ } = rx_message.recv().await.unwrap();
+    match bincode::deserialize(&batch).unwrap() {
+        WorkerMessage::LocalBatch(batch) => {
+            assert_eq!(batch.sequence, 0);
+            assert_eq!(batch.edges, vec![(10, 11), (10, 12), (11, 12)]);
+        }
+        _ => panic!("Unexpected message"),
+    }
+}
+
+#[tokio::test]
 async fn local_order_persists_across_batches() {
     let (tx_transaction, rx_transaction) = channel(2);
     let (tx_message, mut rx_message) = channel(2);
