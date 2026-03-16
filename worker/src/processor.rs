@@ -35,6 +35,8 @@ impl Processor {
         tx_digest: Sender<SerializedBatchDigestMessage>,
         // Whether we are processing our own batches or the batches of other nodes.
         own_digest: bool,
+        // Whether this processor should emit benchmark size/sample logs.
+        benchmark_log_batches: bool,
     ) {
         tokio::spawn(async move {
             while let Some(batch) = rx_batch.recv().await {
@@ -42,7 +44,7 @@ impl Processor {
                 let digest = Digest(Sha512::digest(&batch).as_slice()[..32].try_into().unwrap());
 
                 #[cfg(feature = "benchmark")]
-                if own_digest {
+                if own_digest && benchmark_log_batches {
                     if let Ok(WorkerMessage::GlobalBatch(global)) =
                         bincode::deserialize::<WorkerMessage>(&batch)
                     {

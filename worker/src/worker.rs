@@ -70,6 +70,13 @@ impl Worker {
             parameters,
             store,
         };
+        let benchmark_canonical = worker
+            .committee
+            .authorities
+            .keys()
+            .min()
+            .copied()
+            == Some(worker.name);
 
         // Spawn all worker tasks.
         let (tx_primary, rx_primary) = channel(CHANNEL_CAPACITY);
@@ -92,7 +99,12 @@ impl Worker {
         );
 
         worker.handle_primary_messages();
-        worker.handle_clients_transactions(tx_primary.clone(), tx_own_local, rx_global);
+        worker.handle_clients_transactions(
+            tx_primary.clone(),
+            tx_own_local,
+            rx_global,
+            benchmark_canonical,
+        );
         worker.handle_workers_messages(tx_primary, tx_workers_local);
 
         // The `PrimaryConnector` allows the worker to send messages to its primary.
@@ -160,6 +172,7 @@ impl Worker {
         tx_primary: Sender<SerializedBatchDigestMessage>,
         tx_own_local: Sender<SerializedBatchMessage>,
         rx_global: MpscReceiver<SerializedBatchMessage>,
+        benchmark_canonical: bool,
     ) {
         let (tx_batch_maker, rx_batch_maker) = channel(CHANNEL_CAPACITY);
         let (tx_quorum_waiter, rx_quorum_waiter) = channel(CHANNEL_CAPACITY);
@@ -207,6 +220,7 @@ impl Worker {
             /* rx_batch */ rx_global,
             /* tx_digest */ tx_primary,
             /* own_batch */ true,
+            /* benchmark_log_batches */ benchmark_canonical,
         );
 
         info!(
@@ -256,6 +270,7 @@ impl Worker {
             /* rx_batch */ rx_processor,
             /* tx_digest */ tx_primary,
             /* own_batch */ false,
+            /* benchmark_log_batches */ false,
         );
 
         info!(

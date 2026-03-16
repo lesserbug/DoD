@@ -58,6 +58,12 @@ class LogParser:
         self.sizes = {
             k: v for x in sizes for k, v in x.items() if k in self.commits
         }
+        self.measured_proposals = {
+            k: v for k, v in self.proposals.items() if k in self.sizes
+        }
+        self.measured_commits = {
+            k: v for k, v in self.commits.items() if k in self.sizes
+        }
         self.received_samples = {}
         for samples in received_samples:
             for tx_id, batch_ids in samples.items():
@@ -159,9 +165,9 @@ class LogParser:
         return datetime.timestamp(x)
 
     def _consensus_throughput(self):
-        if not self.commits:
+        if not self.measured_commits:
             return 0, 0, 0
-        start, end = min(self.proposals.values()), max(self.commits.values())
+        start, end = min(self.measured_proposals.values()), max(self.measured_commits.values())
         duration = end - start
         bytes = sum(self.sizes.values())
         bps = bytes / duration
@@ -169,13 +175,13 @@ class LogParser:
         return tps, bps, duration
 
     def _consensus_latency(self):
-        latency = [c - self.proposals[d] for d, c in self.commits.items()]
+        latency = [c - self.measured_proposals[d] for d, c in self.measured_commits.items()]
         return mean(latency) if latency else 0
 
     def _end_to_end_throughput(self):
-        if not self.commits:
+        if not self.measured_commits:
             return 0, 0, 0
-        start, end = min(self.start), max(self.commits.values())
+        start, end = min(self.start), max(self.measured_commits.values())
         duration = end - start
         bytes = sum(self.sizes.values())
         bps = bytes / duration
@@ -189,9 +195,9 @@ class LogParser:
                 continue
 
             committed = [
-                self.commits[batch_id]
+                self.measured_commits[batch_id]
                 for batch_id in batch_ids
-                if batch_id in self.commits
+                if batch_id in self.measured_commits
             ]
             if committed:
                 start = self.sent_samples[tx_id]
