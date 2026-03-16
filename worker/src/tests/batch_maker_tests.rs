@@ -167,8 +167,8 @@ async fn local_order_links_to_all_prior_conflicting_txs() {
 
 #[tokio::test]
 async fn local_order_persists_across_batches() {
-    let (tx_transaction, rx_transaction) = channel(2);
-    let (tx_message, mut rx_message) = channel(2);
+    let (tx_transaction, rx_transaction) = channel(3);
+    let (tx_message, mut rx_message) = channel(3);
     let dummy_addresses = vec![(PublicKey::default(), "127.0.0.1:0".parse().unwrap())];
 
     BatchMaker::spawn(
@@ -208,6 +208,22 @@ async fn local_order_persists_across_batches() {
         WorkerMessage::LocalBatch(batch) => {
             assert_eq!(batch.sequence, 1);
             assert_eq!(batch.edges, vec![(42, 43)]);
+        }
+        _ => panic!("Unexpected message"),
+    }
+
+    tx_transaction
+        .send(standard_transaction(44, 9))
+        .await
+        .unwrap();
+    let QuorumWaiterMessage {
+        batch: third_batch,
+        handlers: _,
+    } = rx_message.recv().await.unwrap();
+    match bincode::deserialize(&third_batch).unwrap() {
+        WorkerMessage::LocalBatch(batch) => {
+            assert_eq!(batch.sequence, 2);
+            assert_eq!(batch.edges, vec![(43, 44)]);
         }
         _ => panic!("Unexpected message"),
     }
