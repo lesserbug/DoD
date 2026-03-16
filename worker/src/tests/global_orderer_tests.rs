@@ -1,6 +1,6 @@
 // Copyright(C) Facebook, Inc. and its affiliates.
 use super::*;
-use crate::batch_maker::parse_transaction_id_and_state_key;
+use crate::batch_maker::{parse_transaction_id_and_state_key, BatchMakerControl, OrderHint};
 use crate::common::{committee_with_base_port, keys, standard_transaction};
 use std::collections::HashMap;
 use tokio::sync::mpsc::channel;
@@ -70,9 +70,18 @@ async fn emits_global_batch_after_n_minus_f_local_graphs() {
 
     let (tx_own, rx_own) = channel(10);
     let (tx_workers, rx_workers) = channel(10);
+    let (tx_control, _rx_control) = channel(10);
     let (tx_global, mut rx_global) = channel(10);
 
-    GlobalOrderer::spawn(name, committee, rx_own, rx_workers, tx_global, vec![]);
+    GlobalOrderer::spawn(
+        name,
+        committee,
+        rx_own,
+        rx_workers,
+        tx_control,
+        tx_global,
+        vec![],
+    );
 
     tx_own
         .send(make_local_graph(name, 0, &[10, 11], 7, vec![(10, 11)]))
@@ -115,9 +124,18 @@ async fn keeps_legacy_sample_transactions_in_global_graph() {
 
     let (tx_own, rx_own) = channel(10);
     let (tx_workers, rx_workers) = channel(10);
+    let (tx_control, _rx_control) = channel(10);
     let (tx_global, mut rx_global) = channel(10);
 
-    GlobalOrderer::spawn(name, committee, rx_own, rx_workers, tx_global, vec![]);
+    GlobalOrderer::spawn(
+        name,
+        committee,
+        rx_own,
+        rx_workers,
+        tx_control,
+        tx_global,
+        vec![],
+    );
 
     let own_graph = make_custom_local_graph(
         name,
@@ -170,9 +188,18 @@ async fn performs_transitive_reduction_on_global_graph() {
 
     let (tx_own, rx_own) = channel(10);
     let (tx_workers, rx_workers) = channel(10);
+    let (tx_control, _rx_control) = channel(10);
     let (tx_global, mut rx_global) = channel(10);
 
-    GlobalOrderer::spawn(name, committee, rx_own, rx_workers, tx_global, vec![]);
+    GlobalOrderer::spawn(
+        name,
+        committee,
+        rx_own,
+        rx_workers,
+        tx_control,
+        tx_global,
+        vec![],
+    );
 
     tx_own
         .send(make_local_graph(
@@ -225,9 +252,18 @@ async fn records_missing_edges_when_support_is_ambiguous() {
 
     let (tx_own, rx_own) = channel(10);
     let (tx_workers, rx_workers) = channel(10);
+    let (tx_control, _rx_control) = channel(10);
     let (tx_global, mut rx_global) = channel(10);
 
-    GlobalOrderer::spawn(name, committee, rx_own, rx_workers, tx_global, vec![]);
+    GlobalOrderer::spawn(
+        name,
+        committee,
+        rx_own,
+        rx_workers,
+        tx_control,
+        tx_global,
+        vec![],
+    );
 
     tx_own
         .send(make_custom_local_graph(
@@ -305,4 +341,77 @@ fn selects_a_deterministic_quorum_subset() {
         selected_authors,
         authors[..committee.quorum_threshold() as usize].to_vec()
     );
+}
+
+#[tokio::test]
+async fn emits_directional_order_hints_when_support_is_biased_but_below_threshold() {
+    let (name, _) = keys().pop().unwrap();
+    let committee = committee_with_base_port(15_000);
+    let peers: Vec<_> = committee
+        .others_workers(&name, &0)
+        .into_iter()
+        .map(|(peer, _)| peer)
+        .take(2)
+        .collect();
+
+    let (tx_own, rx_own) = channel(10);
+    let (tx_workers, rx_workers) = channel(10);
+    let (tx_control, mut rx_control) = channel(10);
+    let (tx_global, mut rx_global) = channel(10);
+
+    GlobalOrderer::spawn(
+        name,
+        committee,
+        rx_own,
+        rx_workers,
+        tx_control,
+        tx_global,
+        vec![],
+    );
+
+    tx_own
+        .send(make_custom_local_graph(
+            name,
+            0,
+            vec![standard_transaction(1, 5), standard_transaction(2, 5)],
+            vec![(1, 2)],
+        ))
+        .await
+        .unwrap();
+
+    for peer in peers {
+        tx_workers
+            .send(make_custom_local_graph(
+                peer,
+                0,
+                vec![standard_transaction(1, 5), standard_transaction(2, 5)],
+                vec![],
+            ))
+            .await
+            .unwrap();
+    }
+
+    let _ = rx_global
+        .recv()
+        .await
+        .expect("Global orderer did not output a global graph");
+
+    match rx_control
+        .recv()
+        .await
+        .expect("Global orderer did not emit order hints")
+    {
+        BatchMakerControl::MergeOrderHints(hints) => {
+            assert_eq!(
+                hints,
+                vec![OrderHint {
+                    predecessor: 1,
+                    successor: 2,
+                    state_key: 5,
+                    weight: 1,
+                    observed_at_sequence: 0,
+                }]
+            );
+        }
+    }
 }

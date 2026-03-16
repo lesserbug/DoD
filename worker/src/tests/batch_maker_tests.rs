@@ -29,6 +29,7 @@ fn parses_legacy_sample_transaction_layout() {
 #[tokio::test]
 async fn make_batch() {
     let (tx_transaction, rx_transaction) = channel(1);
+    let (_tx_control, rx_control) = channel(1);
     let (tx_message, mut rx_message) = channel(1);
     let dummy_addresses = vec![(PublicKey::default(), "127.0.0.1:0".parse().unwrap())];
 
@@ -38,6 +39,7 @@ async fn make_batch() {
         /* max_batch_size */ 200,
         /* max_batch_delay */ 1_000_000, // Ensure the timer is not triggered.
         rx_transaction,
+        rx_control,
         tx_message,
         /* workers_addresses */ dummy_addresses,
     );
@@ -64,6 +66,7 @@ async fn make_batch() {
 #[tokio::test]
 async fn batch_timeout() {
     let (tx_transaction, rx_transaction) = channel(1);
+    let (_tx_control, rx_control) = channel(1);
     let (tx_message, mut rx_message) = channel(1);
     let dummy_addresses = vec![(PublicKey::default(), "127.0.0.1:0".parse().unwrap())];
 
@@ -73,6 +76,7 @@ async fn batch_timeout() {
         /* max_batch_size */ 200,
         /* max_batch_delay */ 50, // Ensure the timer is triggered.
         rx_transaction,
+        rx_control,
         tx_message,
         /* workers_addresses */ dummy_addresses,
     );
@@ -98,6 +102,7 @@ async fn batch_timeout() {
 #[tokio::test]
 async fn local_order_adds_edge_for_conflicting_txs_in_same_batch() {
     let (tx_transaction, rx_transaction) = channel(2);
+    let (_tx_control, rx_control) = channel(1);
     let (tx_message, mut rx_message) = channel(1);
     let dummy_addresses = vec![(PublicKey::default(), "127.0.0.1:0".parse().unwrap())];
 
@@ -106,6 +111,7 @@ async fn local_order_adds_edge_for_conflicting_txs_in_same_batch() {
         /* max_batch_size */ 200,
         /* max_batch_delay */ 1_000_000,
         rx_transaction,
+        rx_control,
         tx_message,
         dummy_addresses,
     );
@@ -132,6 +138,7 @@ async fn local_order_adds_edge_for_conflicting_txs_in_same_batch() {
 #[tokio::test]
 async fn local_order_links_to_all_prior_conflicting_txs() {
     let (tx_transaction, rx_transaction) = channel(3);
+    let (_tx_control, rx_control) = channel(1);
     let (tx_message, mut rx_message) = channel(1);
     let dummy_addresses = vec![(PublicKey::default(), "127.0.0.1:0".parse().unwrap())];
 
@@ -140,6 +147,7 @@ async fn local_order_links_to_all_prior_conflicting_txs() {
         /* max_batch_size */ 300,
         /* max_batch_delay */ 1_000_000,
         rx_transaction,
+        rx_control,
         tx_message,
         dummy_addresses,
     );
@@ -170,6 +178,7 @@ async fn local_order_links_to_all_prior_conflicting_txs() {
 #[tokio::test]
 async fn local_order_persists_across_batches() {
     let (tx_transaction, rx_transaction) = channel(3);
+    let (_tx_control, rx_control) = channel(4);
     let (tx_message, mut rx_message) = channel(3);
     let dummy_addresses = vec![(PublicKey::default(), "127.0.0.1:0".parse().unwrap())];
 
@@ -178,6 +187,7 @@ async fn local_order_persists_across_batches() {
         /* max_batch_size */ 100,
         /* max_batch_delay */ 1_000_000,
         rx_transaction,
+        rx_control,
         tx_message,
         dummy_addresses,
     );
@@ -225,7 +235,97 @@ async fn local_order_persists_across_batches() {
     match bincode::deserialize(&third_batch).unwrap() {
         WorkerMessage::LocalBatch(batch) => {
             assert_eq!(batch.sequence, 2);
-            assert_eq!(batch.edges, vec![(43, 44)]);
+            assert_eq!(batch.edges, vec![(42, 44), (43, 44)]);
+        }
+        _ => panic!("Unexpected message"),
+    }
+}
+
+#[tokio::test]
+async fn local_order_applies_order_hints_for_unseen_predecessors() {
+    let (tx_transaction, rx_transaction) = channel(1);
+    let (tx_control, rx_control) = channel(2);
+    let (tx_message, mut rx_message) = channel(1);
+    let dummy_addresses = vec![(PublicKey::default(), "127.0.0.1:0".parse().unwrap())];
+
+    BatchMaker::spawn(
+        PublicKey::default(),
+        /* max_batch_size */ 100,
+        /* max_batch_delay */ 1_000_000,
+        rx_transaction,
+        rx_control,
+        tx_message,
+        dummy_addresses,
+    );
+
+    tx_control
+        .send(BatchMakerControl::MergeOrderHints(vec![OrderHint {
+            predecessor: 50,
+            successor: 51,
+            state_key: 4,
+            weight: 1,
+            observed_at_sequence: 0,
+        }]))
+        .await
+        .unwrap();
+
+    tx_transaction
+        .send(standard_transaction(51, 4))
+        .await
+        .unwrap();
+
+    let QuorumWaiterMessage { batch, handlers: _ } = rx_message.recv().await.unwrap();
+    match bincode::deserialize(&batch).unwrap() {
+        WorkerMessage::LocalBatch(batch) => {
+            assert_eq!(batch.sequence, 0);
+            assert_eq!(batch.edges, vec![(50, 51)]);
+        }
+        _ => panic!("Unexpected message"),
+    }
+}
+
+#[tokio::test]
+async fn local_order_ignores_hints_that_conflict_with_current_batch_order() {
+    let (tx_transaction, rx_transaction) = channel(2);
+    let (tx_control, rx_control) = channel(2);
+    let (tx_message, mut rx_message) = channel(1);
+    let dummy_addresses = vec![(PublicKey::default(), "127.0.0.1:0".parse().unwrap())];
+
+    BatchMaker::spawn(
+        PublicKey::default(),
+        /* max_batch_size */ 200,
+        /* max_batch_delay */ 1_000_000,
+        rx_transaction,
+        rx_control,
+        tx_message,
+        dummy_addresses,
+    );
+
+    tx_control
+        .send(BatchMakerControl::MergeOrderHints(vec![OrderHint {
+            predecessor: 60,
+            successor: 61,
+            state_key: 8,
+            weight: 1,
+            observed_at_sequence: 0,
+        }]))
+        .await
+        .unwrap();
+
+    tx_transaction
+        .send(standard_transaction(61, 8))
+        .await
+        .unwrap();
+    tx_transaction
+        .send(standard_transaction(60, 8))
+        .await
+        .unwrap();
+
+    let QuorumWaiterMessage { batch, handlers: _ } = rx_message.recv().await.unwrap();
+    match bincode::deserialize(&batch).unwrap() {
+        WorkerMessage::LocalBatch(batch) => {
+            assert_eq!(batch.sequence, 0);
+            assert_eq!(batch.edges, vec![(61, 60)]);
         }
         _ => panic!("Unexpected message"),
     }

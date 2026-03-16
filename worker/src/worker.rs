@@ -1,5 +1,5 @@
 // Copyright(C) Facebook, Inc. and its affiliates.
-use crate::batch_maker::{Batch, BatchMaker, Transaction};
+use crate::batch_maker::{Batch, BatchMaker, BatchMakerControl, Transaction};
 use crate::global_orderer::GlobalOrderer;
 use crate::helper::Helper;
 use crate::primary_connector::PrimaryConnector;
@@ -77,6 +77,7 @@ impl Worker {
         let (tx_primary, rx_primary) = channel(CHANNEL_CAPACITY);
         let (tx_own_local, rx_own_local) = channel(CHANNEL_CAPACITY);
         let (tx_workers_local, rx_workers_local) = channel(CHANNEL_CAPACITY);
+        let (tx_batch_control, rx_batch_control) = channel(CHANNEL_CAPACITY);
         let (tx_global, rx_global) = channel(CHANNEL_CAPACITY);
 
         GlobalOrderer::spawn(
@@ -84,6 +85,7 @@ impl Worker {
             worker.committee.clone(),
             rx_own_local,
             rx_workers_local,
+            tx_batch_control,
             tx_global,
             worker
                 .committee
@@ -97,6 +99,7 @@ impl Worker {
         worker.handle_clients_transactions(
             tx_primary.clone(),
             tx_own_local,
+            rx_batch_control,
             rx_global,
             benchmark_canonical,
         );
@@ -166,6 +169,7 @@ impl Worker {
         &self,
         tx_primary: Sender<SerializedBatchDigestMessage>,
         tx_own_local: Sender<SerializedBatchMessage>,
+        rx_batch_control: MpscReceiver<BatchMakerControl>,
         rx_global: MpscReceiver<SerializedBatchMessage>,
         benchmark_canonical: bool,
     ) {
@@ -191,6 +195,7 @@ impl Worker {
             self.parameters.batch_size,
             self.parameters.max_batch_delay,
             /* rx_transaction */ rx_batch_maker,
+            /* rx_control */ rx_batch_control,
             /* tx_message */ tx_quorum_waiter,
             /* workers_addresses */
             self.committee
