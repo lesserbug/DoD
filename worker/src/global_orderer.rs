@@ -226,10 +226,8 @@ impl GlobalOrderer {
         sequence: u64,
         local_graphs: Vec<Batch>,
     ) -> Batch {
-        let total_stake: Stake = committee.authorities.values().map(|authority| authority.stake).sum();
+        let quorum = committee.quorum_threshold();
         let validity = committee.validity_threshold();
-        let faults = total_stake.saturating_sub(committee.quorum_threshold());
-        let fixed_threshold = total_stake.saturating_sub(2 * faults);
 
         let mut support: HashMap<u64, Stake> = HashMap::new();
         let mut canonical_tx: HashMap<u64, Transaction> = HashMap::new();
@@ -264,12 +262,12 @@ impl GlobalOrderer {
 
         let fixed_txs: HashSet<u64> = support
             .iter()
-            .filter_map(|(tx_id, count)| (*count >= fixed_threshold).then_some(*tx_id))
+            .filter_map(|(tx_id, count)| (*count >= quorum).then_some(*tx_id))
             .collect();
         let pending_txs: HashSet<u64> = support
             .iter()
             .filter_map(|(tx_id, count)| {
-                (*count >= validity && *count < fixed_threshold).then_some(*tx_id)
+                (*count >= validity && *count < quorum).then_some(*tx_id)
             })
             .collect();
 
