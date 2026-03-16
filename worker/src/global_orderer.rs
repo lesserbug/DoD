@@ -1,7 +1,7 @@
 // Copyright(C) Facebook, Inc. and its affiliates.
 use crate::batch_maker::{
     parse_standard_transaction, parse_transaction_id_and_state_key, Batch, BatchMakerControl,
-    OrderHint, Transaction,
+    Transaction,
 };
 use crate::processor::SerializedBatchMessage;
 use crate::worker::WorkerMessage;
@@ -29,11 +29,6 @@ struct SequenceState {
     quorum_reached_at: Option<Instant>,
 }
 
-struct FinalizedGlobalBatch {
-    batch: Batch,
-    order_hints: Vec<OrderHint>,
-}
-
 /// Collects local-order graphs and produces a global-order graph (DoD Algorithm 2).
 pub struct GlobalOrderer {
     /// The public key of this authority.
@@ -44,7 +39,7 @@ pub struct GlobalOrderer {
     rx_own_local: Receiver<SerializedBatchMessage>,
     /// Receives local-order graphs broadcast by other workers.
     rx_workers_local: Receiver<SerializedBatchMessage>,
-    /// Feeds bounded order hints back into the local batch maker.
+    /// Feeds global-order observations back into the local batch maker.
     tx_batch_control: Sender<BatchMakerControl>,
     /// Outputs serialized `WorkerMessage::GlobalBatch` graphs.
     tx_global: Sender<SerializedBatchMessage>,
@@ -248,12 +243,13 @@ impl GlobalOrderer {
     async fn finalize_sequence(&mut self, sequence: u64, graphs: Vec<Batch>) -> bool {
         let name = self.name;
         let committee = self.committee.clone();
-        let finalized = tokio::task::spawn_blocking(move || {
+        let global_batch = tokio::task::spawn_blocking(move || {
             Self::build_global_batch(name, committee, sequence, graphs)
         })
         .await
         .expect("Global orderer task panicked while building global-order graph");
-        let message = WorkerMessage::GlobalBatch(finalized.batch);
+        let control = BatchMakerControl::observe_global_batch(&global_batch);
+        let message = WorkerMessage::GlobalBatch(global_batch);
         let serialized = bincode::serialize(&message)
             .expect("Failed to serialize global-order graph as worker message");
 
@@ -303,12 +299,10 @@ impl GlobalOrderer {
             .await
             .expect("Failed to send global-order graph");
 
-        if !finalized.order_hints.is_empty() {
-            self.tx_batch_control
-                .send(BatchMakerControl::MergeOrderHints(finalized.order_hints))
-                .await
-                .expect("Failed to send order hints to batch maker");
-        }
+        self.tx_batch_control
+            .send(control)
+            .await
+            .expect("Failed to send global-order observation to batch maker");
 
         true
     }
@@ -318,7 +312,7 @@ impl GlobalOrderer {
         committee: Committee,
         sequence: u64,
         local_graphs: Vec<Batch>,
-    ) -> FinalizedGlobalBatch {
+    ) -> Batch {
         let fixed_threshold = Self::fixed_threshold(&committee);
         let pending_threshold = Self::pending_threshold(&committee);
 
@@ -373,14 +367,6 @@ impl GlobalOrderer {
         let mut edges =
             Self::build_weighted_edges(&nodes, &state_key, &edge_weights, pending_threshold);
         Self::retain_sccs_with_path_to_fixed(&mut nodes, &mut edges, &fixed_txs, &pending_txs);
-
-        let order_hints = Self::collect_order_hints(
-            sequence,
-            &nodes,
-            &state_key,
-            &edge_weights,
-            pending_threshold,
-        );
         let sccs = Self::tarjan_scc(&nodes, &edges);
         let component_index = Self::component_index(&sccs);
         let missing_edges =
@@ -406,15 +392,12 @@ impl GlobalOrderer {
             .collect();
         final_missing_edges.sort_unstable();
 
-        FinalizedGlobalBatch {
-            batch: Batch {
-                author: name,
-                sequence,
-                transactions,
-                edges: final_edges,
-                missing_edges: final_missing_edges,
-            },
-            order_hints,
+        Batch {
+            author: name,
+            sequence,
+            transactions,
+            edges: final_edges,
+            missing_edges: final_missing_edges,
         }
     }
 
@@ -499,62 +482,6 @@ impl GlobalOrderer {
         }
 
         edges
-    }
-
-    fn collect_order_hints(
-        sequence: u64,
-        nodes: &HashSet<u64>,
-        state_key: &HashMap<u64, u8>,
-        edge_weights: &HashMap<(u64, u64), Stake>,
-        threshold: Stake,
-    ) -> Vec<OrderHint> {
-        let mut txs_by_key: HashMap<u8, Vec<u64>> = HashMap::new();
-        for &tx_id in nodes {
-            if let Some(&key) = state_key.get(&tx_id) {
-                txs_by_key.entry(key).or_default().push(tx_id);
-            }
-        }
-
-        let mut hints = Vec::new();
-        for (&key, tx_ids) in txs_by_key.iter_mut() {
-            tx_ids.sort_unstable();
-            for (index, &left) in tx_ids.iter().enumerate() {
-                for &right in tx_ids.iter().skip(index + 1) {
-                    let forward = edge_weights.get(&(left, right)).copied().unwrap_or(0);
-                    let backward = edge_weights.get(&(right, left)).copied().unwrap_or(0);
-
-                    if forward == backward || forward.max(backward) >= threshold {
-                        continue;
-                    }
-
-                    let (predecessor, successor, weight) = if forward > backward {
-                        (left, right, forward)
-                    } else {
-                        (right, left, backward)
-                    };
-
-                    if weight == 0 {
-                        continue;
-                    }
-
-                    hints.push(OrderHint {
-                        predecessor,
-                        successor,
-                        state_key: key,
-                        weight,
-                        observed_at_sequence: sequence,
-                    });
-                }
-            }
-        }
-
-        hints.sort_unstable_by(|left, right| {
-            left.successor
-                .cmp(&right.successor)
-                .then_with(|| right.weight.cmp(&left.weight))
-                .then_with(|| left.predecessor.cmp(&right.predecessor))
-        });
-        hints
     }
 
     fn retain_sccs_with_path_to_fixed(

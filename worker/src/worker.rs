@@ -85,7 +85,7 @@ impl Worker {
             worker.committee.clone(),
             rx_own_local,
             rx_workers_local,
-            tx_batch_control,
+            tx_batch_control.clone(),
             tx_global,
             worker
                 .committee
@@ -103,7 +103,7 @@ impl Worker {
             rx_global,
             benchmark_canonical,
         );
-        worker.handle_workers_messages(tx_primary, tx_workers_local);
+        worker.handle_workers_messages(tx_primary, tx_workers_local, tx_batch_control);
 
         // The `PrimaryConnector` allows the worker to send messages to its primary.
         PrimaryConnector::spawn(
@@ -234,6 +234,7 @@ impl Worker {
         &self,
         tx_primary: Sender<SerializedBatchDigestMessage>,
         tx_workers_local: Sender<SerializedBatchMessage>,
+        tx_batch_control: Sender<BatchMakerControl>,
     ) {
         let (tx_helper, rx_helper) = channel(CHANNEL_CAPACITY);
         let (tx_processor, rx_processor) = channel(CHANNEL_CAPACITY);
@@ -252,6 +253,7 @@ impl Worker {
                 tx_helper,
                 tx_processor,
                 tx_workers_local,
+                tx_batch_control,
             },
         );
 
@@ -307,6 +309,7 @@ struct WorkerReceiverHandler {
     tx_helper: Sender<(Vec<Digest>, PublicKey)>,
     tx_processor: Sender<SerializedBatchMessage>,
     tx_workers_local: Sender<SerializedBatchMessage>,
+    tx_batch_control: Sender<BatchMakerControl>,
 }
 
 #[async_trait]
@@ -323,7 +326,11 @@ impl MessageHandler for WorkerReceiverHandler {
                     .await
                     .expect("Failed to send local graph");
             }
-            Ok(WorkerMessage::GlobalBatch(..)) => {
+            Ok(WorkerMessage::GlobalBatch(batch)) => {
+                self.tx_batch_control
+                    .send(BatchMakerControl::observe_global_batch(&batch))
+                    .await
+                    .expect("Failed to send global graph observation");
                 self.tx_processor
                     .send(serialized.to_vec())
                     .await

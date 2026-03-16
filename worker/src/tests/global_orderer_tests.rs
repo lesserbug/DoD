@@ -1,6 +1,6 @@
 // Copyright(C) Facebook, Inc. and its affiliates.
 use super::*;
-use crate::batch_maker::{parse_transaction_id_and_state_key, BatchMakerControl, OrderHint};
+use crate::batch_maker::{parse_transaction_id_and_state_key, BatchMakerControl};
 use crate::common::{committee_with_base_port, keys, standard_transaction};
 use std::collections::HashMap;
 use tokio::sync::mpsc::channel;
@@ -344,7 +344,7 @@ fn selects_a_deterministic_quorum_subset() {
 }
 
 #[tokio::test]
-async fn emits_directional_order_hints_when_support_is_biased_but_below_threshold() {
+async fn emits_global_graph_observations_for_unresolved_pairs() {
     let (name, _) = keys().pop().unwrap();
     let committee = committee_with_base_port(15_000);
     let peers: Vec<_> = committee
@@ -399,19 +399,12 @@ async fn emits_directional_order_hints_when_support_is_biased_but_below_threshol
     match rx_control
         .recv()
         .await
-        .expect("Global orderer did not emit order hints")
+        .expect("Global orderer did not emit a global-graph observation")
     {
-        BatchMakerControl::MergeOrderHints(hints) => {
-            assert_eq!(
-                hints,
-                vec![OrderHint {
-                    predecessor: 1,
-                    successor: 2,
-                    state_key: 5,
-                    weight: 1,
-                    observed_at_sequence: 0,
-                }]
-            );
+        BatchMakerControl::ObserveGlobalGraph(info) => {
+            assert_eq!(info.sequence, 0);
+            assert_eq!(info.tx_ids, vec![1, 2]);
+            assert_eq!(info.missing_edges, vec![(1, 2)]);
         }
     }
 }

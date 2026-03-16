@@ -19,6 +19,14 @@ fn legacy_sample_transaction(id: u64) -> Transaction {
     tx
 }
 
+fn batch_tx_ids(batch: &Batch) -> Vec<u64> {
+    batch
+        .transactions
+        .iter()
+        .filter_map(|tx| parse_transaction_id_and_state_key(tx).map(|(tx_id, _)| tx_id))
+        .collect()
+}
+
 #[test]
 fn parses_legacy_sample_transaction_layout() {
     let tx = legacy_sample_transaction(42);
@@ -176,9 +184,9 @@ async fn local_order_links_to_all_prior_conflicting_txs() {
 }
 
 #[tokio::test]
-async fn local_order_persists_across_batches() {
+async fn local_order_reintroduces_known_unresolved_transactions_with_bounded_carryover() {
     let (tx_transaction, rx_transaction) = channel(3);
-    let (_tx_control, rx_control) = channel(4);
+    let (tx_control, rx_control) = channel(4);
     let (tx_message, mut rx_message) = channel(3);
     let dummy_addresses = vec![(PublicKey::default(), "127.0.0.1:0".parse().unwrap())];
 
@@ -203,6 +211,7 @@ async fn local_order_persists_across_batches() {
     match bincode::deserialize(&first_batch).unwrap() {
         WorkerMessage::LocalBatch(batch) => {
             assert_eq!(batch.sequence, 0);
+            assert_eq!(batch_tx_ids(&batch), vec![42]);
             assert!(batch.edges.is_empty());
         }
         _ => panic!("Unexpected message"),
@@ -219,10 +228,20 @@ async fn local_order_persists_across_batches() {
     match bincode::deserialize(&second_batch).unwrap() {
         WorkerMessage::LocalBatch(batch) => {
             assert_eq!(batch.sequence, 1);
-            assert_eq!(batch.edges, vec![(42, 43)]);
+            assert_eq!(batch_tx_ids(&batch), vec![43]);
+            assert!(batch.edges.is_empty());
         }
         _ => panic!("Unexpected message"),
     }
+
+    tx_control
+        .send(BatchMakerControl::ObserveGlobalGraph(GlobalGraphInfo {
+            sequence: 7,
+            tx_ids: vec![42, 43],
+            missing_edges: vec![(42, 43)],
+        }))
+        .await
+        .unwrap();
 
     tx_transaction
         .send(standard_transaction(44, 9))
@@ -235,16 +254,17 @@ async fn local_order_persists_across_batches() {
     match bincode::deserialize(&third_batch).unwrap() {
         WorkerMessage::LocalBatch(batch) => {
             assert_eq!(batch.sequence, 2);
-            assert_eq!(batch.edges, vec![(42, 44), (43, 44)]);
+            assert_eq!(batch_tx_ids(&batch), vec![42, 44]);
+            assert_eq!(batch.edges, vec![(42, 44)]);
         }
         _ => panic!("Unexpected message"),
     }
 }
 
 #[tokio::test]
-async fn local_order_applies_order_hints_for_unseen_predecessors() {
-    let (tx_transaction, rx_transaction) = channel(1);
-    let (tx_control, rx_control) = channel(2);
+async fn local_order_stops_reintroducing_transactions_after_observed_resolution() {
+    let (tx_transaction, rx_transaction) = channel(3);
+    let (tx_control, rx_control) = channel(4);
     let (tx_message, mut rx_message) = channel(1);
     let dummy_addresses = vec![(PublicKey::default(), "127.0.0.1:0".parse().unwrap())];
 
@@ -258,74 +278,47 @@ async fn local_order_applies_order_hints_for_unseen_predecessors() {
         dummy_addresses,
     );
 
+    tx_transaction
+        .send(standard_transaction(42, 4))
+        .await
+        .unwrap();
+    let _ = rx_message.recv().await.unwrap();
+
+    tx_transaction
+        .send(standard_transaction(43, 4))
+        .await
+        .unwrap();
+    let _ = rx_message.recv().await.unwrap();
+
     tx_control
-        .send(BatchMakerControl::MergeOrderHints(vec![OrderHint {
-            predecessor: 50,
-            successor: 51,
-            state_key: 4,
-            weight: 1,
-            observed_at_sequence: 0,
-        }]))
+        .send(BatchMakerControl::ObserveGlobalGraph(GlobalGraphInfo {
+            sequence: 0,
+            tx_ids: vec![42, 43],
+            missing_edges: vec![(42, 43)],
+        }))
+        .await
+        .unwrap();
+
+    tx_control
+        .send(BatchMakerControl::ObserveGlobalGraph(GlobalGraphInfo {
+            sequence: 1,
+            tx_ids: vec![42, 43],
+            missing_edges: Vec::new(),
+        }))
         .await
         .unwrap();
 
     tx_transaction
-        .send(standard_transaction(51, 4))
+        .send(standard_transaction(44, 4))
         .await
         .unwrap();
 
     let QuorumWaiterMessage { batch, handlers: _ } = rx_message.recv().await.unwrap();
     match bincode::deserialize(&batch).unwrap() {
         WorkerMessage::LocalBatch(batch) => {
-            assert_eq!(batch.sequence, 0);
-            assert_eq!(batch.edges, vec![(50, 51)]);
-        }
-        _ => panic!("Unexpected message"),
-    }
-}
-
-#[tokio::test]
-async fn local_order_ignores_hints_that_conflict_with_current_batch_order() {
-    let (tx_transaction, rx_transaction) = channel(2);
-    let (tx_control, rx_control) = channel(2);
-    let (tx_message, mut rx_message) = channel(1);
-    let dummy_addresses = vec![(PublicKey::default(), "127.0.0.1:0".parse().unwrap())];
-
-    BatchMaker::spawn(
-        PublicKey::default(),
-        /* max_batch_size */ 200,
-        /* max_batch_delay */ 1_000_000,
-        rx_transaction,
-        rx_control,
-        tx_message,
-        dummy_addresses,
-    );
-
-    tx_control
-        .send(BatchMakerControl::MergeOrderHints(vec![OrderHint {
-            predecessor: 60,
-            successor: 61,
-            state_key: 8,
-            weight: 1,
-            observed_at_sequence: 0,
-        }]))
-        .await
-        .unwrap();
-
-    tx_transaction
-        .send(standard_transaction(61, 8))
-        .await
-        .unwrap();
-    tx_transaction
-        .send(standard_transaction(60, 8))
-        .await
-        .unwrap();
-
-    let QuorumWaiterMessage { batch, handlers: _ } = rx_message.recv().await.unwrap();
-    match bincode::deserialize(&batch).unwrap() {
-        WorkerMessage::LocalBatch(batch) => {
-            assert_eq!(batch.sequence, 0);
-            assert_eq!(batch.edges, vec![(61, 60)]);
+            assert_eq!(batch.sequence, 2);
+            assert_eq!(batch_tx_ids(&batch), vec![44]);
+            assert!(batch.edges.is_empty());
         }
         _ => panic!("Unexpected message"),
     }
