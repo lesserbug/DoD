@@ -84,11 +84,13 @@ class LocalBench:
             rate_share = ceil(rate / committee.workers())
             for i, addresses in enumerate(workers_addresses):
                 for id, address in addresses:
+                    client_id = i * self.workers + id
                     cmd = CommandMaker.run_client(
                         address,
                         self.tx_size,
                         rate_share,
                         [x for y in workers_addresses for wid, x in y if wid == id],
+                        client_id,
                     )
                     log_file = PathMaker.client_log_file(i, id)
                     self._background_run(cmd, log_file)

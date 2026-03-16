@@ -105,6 +105,7 @@ pub fn batch() -> Batch {
         sequence: 0,
         transactions: vec![transaction(), transaction()],
         edges: Vec::new(),
+        missing_edges: Vec::new(),
     }
 }
 

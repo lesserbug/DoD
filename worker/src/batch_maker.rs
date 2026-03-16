@@ -32,6 +32,8 @@ pub struct Batch {
     // Within one local graph we keep every earlier conflicting transaction,
     // while across graphs we only carry the latest known predecessor.
     pub edges: Vec<(u64, u64)>,
+    #[serde(default)]
+    pub missing_edges: Vec<(u64, u64)>,
 }
 
 pub(crate) fn parse_transaction_id_and_state_key(tx: &[u8]) -> Option<(u64, u8)> {
@@ -198,6 +200,7 @@ impl BatchMaker {
             sequence: self.next_sequence,
             transactions,
             edges,
+            missing_edges: Vec::new(),
         };
         self.next_sequence += 1;
 

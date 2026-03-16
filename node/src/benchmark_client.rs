@@ -22,6 +22,7 @@ async fn main() -> Result<()> {
         .args_from_usage("<ADDR> 'The network address of the node where to send txs'")
         .args_from_usage("--size=<INT> 'The size of each transaction in bytes'")
         .args_from_usage("--rate=<INT> 'The rate (txs/s) at which to send the transactions'")
+        .args_from_usage("--client-id=<INT> 'A unique identifier for this benchmark client'")
         .args_from_usage("--nodes=[ADDR]... 'Network addresses that must be reachable before starting the benchmark.'")
         .setting(AppSettings::ArgRequiredElseHelp)
         .get_matches();
@@ -45,6 +46,11 @@ async fn main() -> Result<()> {
         .unwrap()
         .parse::<u64>()
         .context("The rate of transactions must be a non-negative integer")?;
+    let client_id = matches
+        .value_of("client-id")
+        .unwrap_or("0")
+        .parse::<u16>()
+        .context("The client id must be a non-negative integer")?;
     let nodes = matches
         .values_of("nodes")
         .unwrap_or_default()
@@ -65,6 +71,7 @@ async fn main() -> Result<()> {
         target,
         size,
         rate,
+        client_id,
         nodes,
     };
 
@@ -79,10 +86,15 @@ struct Client {
     target: SocketAddr,
     size: usize,
     rate: u64,
+    client_id: u16,
     nodes: Vec<SocketAddr>,
 }
 
 impl Client {
+    fn sample_id(&self, counter: u64) -> u64 {
+        ((self.client_id as u64) << 48) | (counter & 0x0000_FFFF_FFFF_FFFF)
+    }
+
     pub async fn send(&self) -> Result<()> {
         const PRECISION: u64 = 20; // Sample precision.
         const BURST_DURATION: u64 = 1000 / PRECISION;
@@ -142,11 +154,12 @@ impl Client {
 
             for x in 0..burst {
                 if x == counter % burst {
+                    let sample_id = self.sample_id(counter);
                     // NOTE: This log entry is used to compute performance.
-                    info!("Sending sample transaction {}", counter);
+                    info!("Sending sample transaction {}", sample_id);
 
                     tx.put_u8(0u8); // Sample txs start with 0.
-                    tx.put_u64(counter); // This counter identifies the tx.
+                    tx.put_u64(sample_id); // This identifies the tx globally.
                     tx.put_u8(0u8); // Keep a fixed-length DoD transaction layout.
                 } else {
                     r = r.wrapping_add(1);

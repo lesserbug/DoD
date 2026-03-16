@@ -52,6 +52,7 @@ async fn make_batch() {
         sequence: 0,
         transactions: vec![transaction(), transaction()],
         edges: Vec::new(),
+        missing_edges: Vec::new(),
     };
     let QuorumWaiterMessage { batch, handlers: _ } = rx_message.recv().await.unwrap();
     match bincode::deserialize(&batch).unwrap() {
@@ -85,6 +86,7 @@ async fn batch_timeout() {
         sequence: 0,
         transactions: vec![transaction()],
         edges: Vec::new(),
+        missing_edges: Vec::new(),
     };
     let QuorumWaiterMessage { batch, handlers: _ } = rx_message.recv().await.unwrap();
     match bincode::deserialize(&batch).unwrap() {

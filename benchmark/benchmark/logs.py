@@ -34,8 +34,8 @@ class LogParser:
                 results = p.map(self._parse_clients, clients)
         except (ValueError, IndexError, AttributeError) as e:
             raise ParseError(f'Failed to parse clients\' logs: {e}')
-        self.size, self.rate, self.start, misses, self.sent_samples \
-            = zip(*results)
+        self.size, self.rate, self.start, misses, sent_samples = zip(*results)
+        self.sent_samples = self._merge_results([x.items() for x in sent_samples])
         self.misses = sum(misses)
 
         # Parse the primaries logs.
@@ -54,10 +54,14 @@ class LogParser:
                 results = p.map(self._parse_workers, workers)
         except (ValueError, IndexError, AttributeError) as e:
             raise ParseError(f'Failed to parse workers\' logs: {e}')
-        sizes, self.received_samples, workers_ips = zip(*results)
+        sizes, received_samples, workers_ips = zip(*results)
         self.sizes = {
             k: v for x in sizes for k, v in x.items() if k in self.commits
         }
+        self.received_samples = {}
+        for samples in received_samples:
+            for tx_id, batch_ids in samples.items():
+                self.received_samples.setdefault(tx_id, set()).update(batch_ids)
 
         # Determine whether the primary and the workers are collocated.
         self.collocate = set(primary_ips) == set(workers_ips)
@@ -142,7 +146,9 @@ class LogParser:
         sizes = {d: int(s) for d, s in tmp}
 
         tmp = findall(r'Batch ([^ ]+) contains sample tx (\d+)', log)
-        samples = {int(s): d for d, s in tmp}
+        samples = {}
+        for d, s in tmp:
+            samples.setdefault(int(s), set()).add(d)
 
         ip = search(r'booted on (\d+.\d+.\d+.\d+)', log).group(1)
 
@@ -178,13 +184,18 @@ class LogParser:
 
     def _end_to_end_latency(self):
         latency = []
-        for sent, received in zip(self.sent_samples, self.received_samples):
-            for tx_id, batch_id in received.items():
-                if batch_id in self.commits:
-                    assert tx_id in sent  # We receive txs that we sent.
-                    start = sent[tx_id]
-                    end = self.commits[batch_id]
-                    latency += [end-start]
+        for tx_id, batch_ids in self.received_samples.items():
+            if tx_id not in self.sent_samples:
+                continue
+
+            committed = [
+                self.commits[batch_id]
+                for batch_id in batch_ids
+                if batch_id in self.commits
+            ]
+            if committed:
+                start = self.sent_samples[tx_id]
+                latency += [min(committed) - start]
         return mean(latency) if latency else 0
 
     def result(self):

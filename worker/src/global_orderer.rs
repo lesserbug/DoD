@@ -1,5 +1,7 @@
 // Copyright(C) Facebook, Inc. and its affiliates.
-use crate::batch_maker::{parse_transaction_id_and_state_key, Batch, Transaction};
+use crate::batch_maker::{
+    parse_standard_transaction, parse_transaction_id_and_state_key, Batch, Transaction,
+};
 use crate::processor::SerializedBatchMessage;
 use crate::worker::WorkerMessage;
 use bytes::Bytes;
@@ -224,8 +226,10 @@ impl GlobalOrderer {
         sequence: u64,
         local_graphs: Vec<Batch>,
     ) -> Batch {
-        let quorum = committee.quorum_threshold();
+        let total_stake: Stake = committee.authorities.values().map(|authority| authority.stake).sum();
         let validity = committee.validity_threshold();
+        let faults = total_stake.saturating_sub(committee.quorum_threshold());
+        let fixed_threshold = total_stake.saturating_sub(2 * faults);
 
         let mut support: HashMap<u64, Stake> = HashMap::new();
         let mut canonical_tx: HashMap<u64, Transaction> = HashMap::new();
@@ -235,7 +239,7 @@ impl GlobalOrderer {
             let stake = committee.stake(&graph.author);
             let mut seen = HashSet::new();
             for tx in &graph.transactions {
-                if let Some((tx_id, key)) = parse_transaction_id_and_state_key(tx) {
+                if let Some((tx_id, _key)) = parse_transaction_id_and_state_key(tx) {
                     if seen.insert(tx_id) {
                         *support.entry(tx_id).or_insert(0) += stake;
                     }
@@ -251,18 +255,22 @@ impl GlobalOrderer {
                         }
                     }
 
-                    state_key.entry(tx_id).or_insert(key);
+                    if let Some((_, standard_key)) = parse_standard_transaction(tx) {
+                        state_key.entry(tx_id).or_insert(standard_key);
+                    }
                 }
             }
         }
 
         let fixed_txs: HashSet<u64> = support
             .iter()
-            .filter_map(|(tx_id, count)| (*count >= quorum).then_some(*tx_id))
+            .filter_map(|(tx_id, count)| (*count >= fixed_threshold).then_some(*tx_id))
             .collect();
         let pending_txs: HashSet<u64> = support
             .iter()
-            .filter_map(|(tx_id, count)| (*count >= validity && *count < quorum).then_some(*tx_id))
+            .filter_map(|(tx_id, count)| {
+                (*count >= validity && *count < fixed_threshold).then_some(*tx_id)
+            })
             .collect();
 
         let mut nodes: HashSet<u64> = support
@@ -270,38 +278,14 @@ impl GlobalOrderer {
             .filter_map(|(tx_id, count)| (*count >= validity).then_some(*tx_id))
             .collect();
 
-        let mut edges = HashSet::new();
-        for graph in &local_graphs {
-            for &(from, to) in &graph.edges {
-                if nodes.contains(&from) && nodes.contains(&to) && from != to {
-                    edges.insert((from, to));
-                }
-            }
-        }
+        let mut edges =
+            Self::build_weighted_edges(&committee, &local_graphs, &nodes, &state_key, validity);
+        Self::retain_sccs_with_path_to_fixed(&mut nodes, &mut edges, &fixed_txs, &pending_txs);
 
-        // Re-introduce pending->pending edges that may be missing after a partial merge.
-        let mut missing_edge_set = HashSet::new();
-        for graph in &local_graphs {
-            for &(from, to) in &graph.edges {
-                if !nodes.contains(&from) || !nodes.contains(&to) {
-                    continue;
-                }
-
-                if pending_txs.contains(&from)
-                    && pending_txs.contains(&to)
-                    && state_key.get(&from) == state_key.get(&to)
-                    && !edges.contains(&(from, to))
-                {
-                    missing_edge_set.insert((from, to));
-                }
-            }
-        }
-        edges.extend(missing_edge_set);
-
-        // Remove edges from pending transactions to fixed transactions.
-        edges.retain(|(from, to)| !(pending_txs.contains(from) && fixed_txs.contains(to)));
-
-        Self::prune_cycles(&mut nodes, &mut edges, &fixed_txs, &pending_txs, &state_key);
+        let sccs = Self::tarjan_scc(&nodes, &edges);
+        let component_index = Self::component_index(&sccs);
+        let missing_edges = Self::collect_missing_edges(&nodes, &edges, &component_index, &state_key);
+        Self::linearize_sccs(&mut edges, &sccs);
 
         let reduced_edges = Self::transitive_reduction(&nodes, &edges);
         let ordered_tx_ids = Self::topological_sort(&nodes, &reduced_edges);
@@ -316,15 +300,198 @@ impl GlobalOrderer {
             .filter(|(from, to)| nodes.contains(from) && nodes.contains(to) && from != to)
             .collect();
         final_edges.sort_unstable();
+        let mut final_missing_edges: Vec<_> = missing_edges
+            .into_iter()
+            .filter(|(from, to)| nodes.contains(from) && nodes.contains(to) && from != to)
+            .collect();
+        final_missing_edges.sort_unstable();
 
         Batch {
             author: name,
             sequence,
             transactions,
             edges: final_edges,
+            missing_edges: final_missing_edges,
         }
     }
 
+    fn build_weighted_edges(
+        committee: &Committee,
+        local_graphs: &[Batch],
+        nodes: &HashSet<u64>,
+        state_key: &HashMap<u64, u8>,
+        threshold: Stake,
+    ) -> HashSet<(u64, u64)> {
+        let mut edge_weights: HashMap<(u64, u64), Stake> = HashMap::new();
+        let mut txs_by_key: HashMap<u8, Vec<u64>> = HashMap::new();
+
+        for &tx_id in nodes {
+            if let Some(&key) = state_key.get(&tx_id) {
+                txs_by_key.entry(key).or_default().push(tx_id);
+            }
+        }
+        for tx_ids in txs_by_key.values_mut() {
+            tx_ids.sort_unstable();
+        }
+
+        for graph in local_graphs {
+            let graph_stake = committee.stake(&graph.author);
+            let mut seen_edges = HashSet::new();
+            for &(from, to) in &graph.edges {
+                if nodes.contains(&from)
+                    && nodes.contains(&to)
+                    && from != to
+                    && seen_edges.insert((from, to))
+                {
+                    *edge_weights.entry((from, to)).or_insert(0) += graph_stake;
+                }
+            }
+        }
+
+        let mut edges = HashSet::new();
+        for tx_ids in txs_by_key.values() {
+            for (index, &left) in tx_ids.iter().enumerate() {
+                for &right in tx_ids.iter().skip(index + 1) {
+                    let forward = edge_weights.get(&(left, right)).copied().unwrap_or(0);
+                    let backward = edge_weights.get(&(right, left)).copied().unwrap_or(0);
+
+                    if forward >= threshold && forward > backward {
+                        edges.insert((left, right));
+                    } else if backward >= threshold && backward > forward {
+                        edges.insert((right, left));
+                    }
+                }
+            }
+        }
+
+        edges
+    }
+
+    fn retain_sccs_with_path_to_fixed(
+        nodes: &mut HashSet<u64>,
+        edges: &mut HashSet<(u64, u64)>,
+        fixed_txs: &HashSet<u64>,
+        pending_txs: &HashSet<u64>,
+    ) {
+        let sccs = Self::tarjan_scc(nodes, edges);
+        if sccs.is_empty() {
+            return;
+        }
+
+        let component_index = Self::component_index(&sccs);
+        let mut reverse_edges: HashMap<usize, BTreeSet<usize>> = HashMap::new();
+        let mut fixed_components = HashSet::new();
+        let mut pending_components = HashSet::new();
+
+        for (component, scc) in sccs.iter().enumerate() {
+            if scc.iter().any(|tx_id| fixed_txs.contains(tx_id)) {
+                fixed_components.insert(component);
+            } else if scc.iter().any(|tx_id| pending_txs.contains(tx_id)) {
+                pending_components.insert(component);
+            }
+        }
+
+        if fixed_components.is_empty() {
+            return;
+        }
+
+        for &(from, to) in edges.iter() {
+            let Some(&from_component) = component_index.get(&from) else {
+                continue;
+            };
+            let Some(&to_component) = component_index.get(&to) else {
+                continue;
+            };
+            if from_component != to_component {
+                reverse_edges
+                    .entry(to_component)
+                    .or_default()
+                    .insert(from_component);
+            }
+        }
+
+        let mut keep_components = fixed_components.clone();
+        let mut stack: Vec<_> = fixed_components.into_iter().collect();
+        while let Some(component) = stack.pop() {
+            if let Some(previous) = reverse_edges.get(&component) {
+                for &candidate in previous {
+                    if pending_components.contains(&candidate) && keep_components.insert(candidate) {
+                        stack.push(candidate);
+                    }
+                }
+            }
+        }
+
+        let keep_nodes: HashSet<u64> = keep_components
+            .into_iter()
+            .flat_map(|component| sccs[component].iter().copied())
+            .collect();
+        nodes.retain(|tx_id| keep_nodes.contains(tx_id));
+        edges.retain(|(from, to)| nodes.contains(from) && nodes.contains(to) && from != to);
+    }
+
+    fn component_index(sccs: &[Vec<u64>]) -> HashMap<u64, usize> {
+        let mut component_index = HashMap::new();
+        for (component, scc) in sccs.iter().enumerate() {
+            for &tx_id in scc {
+                component_index.insert(tx_id, component);
+            }
+        }
+        component_index
+    }
+
+    fn collect_missing_edges(
+        nodes: &HashSet<u64>,
+        edges: &HashSet<(u64, u64)>,
+        component_index: &HashMap<u64, usize>,
+        state_key: &HashMap<u64, u8>,
+    ) -> HashSet<(u64, u64)> {
+        let mut txs_by_key: HashMap<u8, Vec<u64>> = HashMap::new();
+        for &tx_id in nodes {
+            if let Some(&key) = state_key.get(&tx_id) {
+                txs_by_key.entry(key).or_default().push(tx_id);
+            }
+        }
+
+        let mut missing_edges = HashSet::new();
+        for tx_ids in txs_by_key.values_mut() {
+            tx_ids.sort_unstable();
+            for (index, &left) in tx_ids.iter().enumerate() {
+                for &right in tx_ids.iter().skip(index + 1) {
+                    if component_index.get(&left) == component_index.get(&right) {
+                        continue;
+                    }
+                    if edges.contains(&(left, right)) || edges.contains(&(right, left)) {
+                        continue;
+                    }
+                    missing_edges.insert((left, right));
+                }
+            }
+        }
+
+        missing_edges
+    }
+
+    fn linearize_sccs(edges: &mut HashSet<(u64, u64)>, sccs: &[Vec<u64>]) {
+        for scc in sccs {
+            if scc.len() <= 1 {
+                continue;
+            }
+
+            let members: HashSet<u64> = scc.iter().copied().collect();
+            edges.retain(|(from, to)| {
+                !(members.contains(from) && members.contains(to))
+            });
+
+            let mut ordered = scc.clone();
+            ordered.sort_unstable();
+            for window in ordered.windows(2) {
+                edges.insert((window[0], window[1]));
+            }
+        }
+    }
+
+    #[allow(dead_code)]
     fn prune_cycles(
         nodes: &mut HashSet<u64>,
         edges: &mut HashSet<(u64, u64)>,

@@ -21,6 +21,7 @@ fn make_local_graph(
         sequence,
         transactions,
         edges,
+        missing_edges: Vec::new(),
     };
     bincode::serialize(&WorkerMessage::LocalBatch(batch)).unwrap()
 }
@@ -36,6 +37,7 @@ fn make_custom_local_graph(
         sequence,
         transactions,
         edges,
+        missing_edges: Vec::new(),
     };
     bincode::serialize(&WorkerMessage::LocalBatch(batch)).unwrap()
 }
@@ -210,7 +212,7 @@ async fn performs_transitive_reduction_on_global_graph() {
 }
 
 #[tokio::test]
-async fn removes_pending_to_fixed_edges() {
+async fn records_missing_edges_when_support_is_ambiguous() {
     let (name, _) = keys().pop().unwrap();
     let committee = committee_with_base_port(14_000);
     let peers: Vec<_> = committee
@@ -227,29 +229,32 @@ async fn removes_pending_to_fixed_edges() {
     GlobalOrderer::spawn(name, committee, rx_own, rx_workers, tx_global, vec![]);
 
     tx_own
-        .send(make_local_graph(
+        .send(make_custom_local_graph(
             name,
             0,
-            &[1, 2, 3],
-            5,
-            vec![(1, 2), (2, 3), (1, 3)],
+            vec![standard_transaction(1, 5), standard_transaction(2, 5)],
+            vec![(1, 2)],
         ))
         .await
         .unwrap();
 
     tx_workers
-        .send(make_local_graph(
+        .send(make_custom_local_graph(
             peers[0],
             0,
-            &[1, 2, 3],
-            5,
-            vec![(1, 2), (2, 3), (1, 3)],
+            vec![standard_transaction(1, 5), standard_transaction(2, 5)],
+            vec![(2, 1)],
         ))
         .await
         .unwrap();
 
     tx_workers
-        .send(make_local_graph(peers[1], 0, &[1, 3], 5, vec![(1, 3)]))
+        .send(make_custom_local_graph(
+            peers[1],
+            0,
+            vec![standard_transaction(1, 5), standard_transaction(2, 5)],
+            vec![],
+        ))
         .await
         .unwrap();
 
@@ -260,9 +265,8 @@ async fn removes_pending_to_fixed_edges() {
 
     match bincode::deserialize(&serialized).unwrap() {
         WorkerMessage::GlobalBatch(batch) => {
-            assert!(batch.edges.contains(&(1, 2)));
-            assert!(batch.edges.contains(&(1, 3)));
-            assert!(!batch.edges.contains(&(2, 3)));
+            assert!(batch.edges.is_empty());
+            assert_eq!(batch.missing_edges, vec![(1, 2)]);
         }
         other => panic!("Unexpected worker message: {:?}", other),
     }

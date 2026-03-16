@@ -35,6 +35,7 @@ async fn handle_clients_transactions() {
         sequence: 0,
         transactions: vec![standard_transaction(1, 7), standard_transaction(2, 7)],
         edges: vec![(1, 2)],
+        missing_edges: Vec::new(),
     };
     let expected_global =
         bincode::serialize(&WorkerMessage::GlobalBatch(expected_global_batch)).unwrap();
@@ -81,6 +82,7 @@ async fn handle_clients_transactions() {
             sequence: 0,
             transactions: vec![standard_transaction(1, 7), standard_transaction(2, 7)],
             edges: vec![(1, 2)],
+            missing_edges: Vec::new(),
         };
         let message = WorkerMessage::LocalBatch(local_batch);
         let serialized = bincode::serialize(&message).unwrap();
