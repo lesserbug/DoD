@@ -184,7 +184,7 @@ async fn local_order_links_to_all_prior_conflicting_txs() {
 }
 
 #[tokio::test]
-async fn local_order_reintroduces_known_unresolved_transactions_with_bounded_carryover() {
+async fn local_order_does_not_rebroadcast_unresolved_transactions_without_execution_feedback() {
     let (tx_transaction, rx_transaction) = channel(3);
     let (tx_control, rx_control) = channel(4);
     let (tx_message, mut rx_message) = channel(3);
@@ -254,8 +254,8 @@ async fn local_order_reintroduces_known_unresolved_transactions_with_bounded_car
     match bincode::deserialize(&third_batch).unwrap() {
         WorkerMessage::LocalBatch(batch) => {
             assert_eq!(batch.sequence, 2);
-            assert_eq!(batch_tx_ids(&batch), vec![42, 44]);
-            assert_eq!(batch.edges, vec![(42, 44)]);
+            assert_eq!(batch_tx_ids(&batch), vec![44]);
+            assert!(batch.edges.is_empty());
         }
         _ => panic!("Unexpected message"),
     }

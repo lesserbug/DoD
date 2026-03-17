@@ -161,7 +161,6 @@ impl BatchMaker {
     const MAX_KNOWN_TX_HISTORY_SEQUENCES: u64 = 32;
     const MAX_MISSING_EDGE_HISTORY_SEQUENCES: u64 = 32;
     const MAX_RETAINED_UNRESOLVED_TXS: usize = 512;
-    const MAX_CARRYOVER_TXS_PER_BATCH: usize = 256;
 
     pub fn spawn(
         name: PublicKey,
@@ -220,7 +219,7 @@ impl BatchMaker {
 
                 // If the timer triggers, seal the batch even if it contains few transactions.
                 () = &mut timer => {
-                    if !self.current_batch.is_empty() || !self.retained_unresolved.is_empty() {
+                    if !self.current_batch.is_empty() {
                         self.seal().await;
                     }
                     timer.as_mut().reset(Instant::now() + Duration::from_millis(self.max_batch_delay));
@@ -253,8 +252,7 @@ impl BatchMaker {
         self.prune_local_state(sequence);
 
         self.current_batch_size = 0;
-        let fresh_transactions: Vec<_> = self.current_batch.drain(..).collect();
-        let transactions = self.compose_transactions_for_sequence(fresh_transactions);
+        let transactions: Vec<_> = self.current_batch.drain(..).collect();
 
         let standard_txs: Vec<_> = transactions
             .iter()
@@ -323,54 +321,6 @@ impl BatchMaker {
             })
             .await
             .expect("Failed to deliver batch");
-    }
-
-    fn compose_transactions_for_sequence(
-        &self,
-        fresh_transactions: Vec<Transaction>,
-    ) -> Vec<Transaction> {
-        let mut transactions = Vec::new();
-        let mut included_standard = HashSet::new();
-        let mut carryover_bytes = 0usize;
-
-        for tx_id in self.retained_unresolved_ids() {
-            if transactions.len() >= Self::MAX_CARRYOVER_TXS_PER_BATCH
-                || carryover_bytes >= self.batch_size
-            {
-                break;
-            }
-
-            let Some(known) = self.known_transactions.get(&tx_id) else {
-                continue;
-            };
-            if included_standard.insert(tx_id) {
-                carryover_bytes += known.transaction.len();
-                transactions.push(known.transaction.clone());
-            }
-        }
-
-        for transaction in fresh_transactions {
-            match parse_standard_transaction(&transaction) {
-                Some((tx_id, _)) if included_standard.insert(tx_id) => {
-                    transactions.push(transaction)
-                }
-                Some(..) => {}
-                None => transactions.push(transaction),
-            }
-        }
-
-        transactions
-    }
-
-    fn retained_unresolved_ids(&self) -> Vec<u64> {
-        let mut tx_ids: Vec<_> = self.retained_unresolved.iter().copied().collect();
-        tx_ids.sort_unstable_by_key(|tx_id| {
-            self.known_transactions
-                .get(tx_id)
-                .map(|known| (known.first_seen_sequence, *tx_id))
-                .unwrap_or((u64::MAX, *tx_id))
-        });
-        tx_ids
     }
 
     fn handle_control(&mut self, control: BatchMakerControl) {
