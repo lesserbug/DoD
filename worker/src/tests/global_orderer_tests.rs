@@ -284,6 +284,129 @@ async fn records_missing_edges_when_support_is_ambiguous() {
 }
 
 #[tokio::test]
+async fn keeps_only_frontier_missing_edges_within_a_key() {
+    let (name, _) = keys().pop().unwrap();
+    let committee = committee_with_base_port(14_150);
+    let peers: Vec<_> = committee
+        .others_workers(&name, &0)
+        .into_iter()
+        .map(|(peer, _)| peer)
+        .take(2)
+        .collect();
+
+    let (tx_own, rx_own) = channel(10);
+    let (tx_workers, rx_workers) = channel(10);
+    let (tx_global, mut rx_global) = channel(10);
+
+    GlobalOrderer::spawn(name, committee, rx_own, rx_workers, tx_global, vec![]);
+
+    tx_own
+        .send(make_custom_local_graph(
+            name,
+            0,
+            vec![
+                standard_transaction(1, 5),
+                standard_transaction(2, 5),
+                standard_transaction(3, 5),
+            ],
+            vec![],
+        ))
+        .await
+        .unwrap();
+
+    for peer in peers {
+        tx_workers
+            .send(make_custom_local_graph(
+                peer,
+                0,
+                vec![
+                    standard_transaction(1, 5),
+                    standard_transaction(2, 5),
+                    standard_transaction(3, 5),
+                ],
+                vec![],
+            ))
+            .await
+            .unwrap();
+    }
+
+    let serialized = rx_global
+        .recv()
+        .await
+        .expect("Global orderer did not output a global graph");
+
+    match bincode::deserialize(&serialized).unwrap() {
+        WorkerMessage::GlobalBatch(batch) => {
+            assert!(batch.edges.is_empty());
+            assert_eq!(batch.missing_edges, vec![(1, 2), (2, 3)]);
+        }
+        other => panic!("Unexpected worker message: {:?}", other),
+    }
+}
+
+#[tokio::test]
+async fn skips_missing_edges_after_linearizing_same_scc() {
+    let (name, _) = keys().pop().unwrap();
+    let committee = committee_with_base_port(14_200);
+    let peers: Vec<_> = committee
+        .others_workers(&name, &0)
+        .into_iter()
+        .map(|(peer, _)| peer)
+        .take(2)
+        .collect();
+
+    let (tx_own, rx_own) = channel(10);
+    let (tx_workers, rx_workers) = channel(10);
+    let (tx_global, mut rx_global) = channel(10);
+
+    GlobalOrderer::spawn(name, committee, rx_own, rx_workers, tx_global, vec![]);
+
+    tx_own
+        .send(make_custom_local_graph(
+            name,
+            0,
+            vec![
+                standard_transaction(1, 5),
+                standard_transaction(2, 5),
+                standard_transaction(3, 5),
+            ],
+            vec![(1, 2), (2, 3), (3, 1)],
+        ))
+        .await
+        .unwrap();
+
+    for peer in peers {
+        tx_workers
+            .send(make_custom_local_graph(
+                peer,
+                0,
+                vec![
+                    standard_transaction(1, 5),
+                    standard_transaction(2, 5),
+                    standard_transaction(3, 5),
+                ],
+                vec![(1, 2), (2, 3), (3, 1)],
+            ))
+            .await
+            .unwrap();
+    }
+
+    let serialized = rx_global
+        .recv()
+        .await
+        .expect("Global orderer did not output a global graph");
+
+    match bincode::deserialize(&serialized).unwrap() {
+        WorkerMessage::GlobalBatch(batch) => {
+            assert_eq!(tx_ids(&batch), vec![1, 2, 3]);
+            assert_eq!(batch.edges, vec![(1, 2), (2, 3)]);
+            assert!(batch.missing_edges.is_empty());
+        }
+        other => panic!("Unexpected worker message: {:?}", other),
+    }
+}
+
+#[tokio::test]
 async fn forwards_local_missing_predecessors_into_global_batch() {
     let (name, _) = keys().pop().unwrap();
     let committee = committee_with_base_port(14_250);

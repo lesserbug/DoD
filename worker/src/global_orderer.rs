@@ -358,8 +358,6 @@ impl GlobalOrderer {
         Self::retain_sccs_with_path_to_fixed(&mut nodes, &mut edges, &fixed_txs, &pending_txs);
         let sccs = Self::tarjan_scc(&nodes, &edges);
         let component_index = Self::component_index(&sccs);
-        let missing_edges =
-            Self::collect_missing_edges(&nodes, &edges, &component_index, &state_key);
         let forwarded_missing_edges = Self::collect_forwarded_missing_edges(
             &committee,
             &local_graphs,
@@ -370,6 +368,13 @@ impl GlobalOrderer {
 
         let reduced_edges = Self::transitive_reduction(&nodes, &edges);
         let ordered_tx_ids = Self::topological_sort(&nodes, &reduced_edges);
+        let missing_edges = Self::collect_missing_edges(
+            &ordered_tx_ids,
+            &nodes,
+            &reduced_edges,
+            &component_index,
+            &state_key,
+        );
 
         let transactions = ordered_tx_ids
             .into_iter()
@@ -560,31 +565,41 @@ impl GlobalOrderer {
     }
 
     fn collect_missing_edges(
+        ordered_tx_ids: &[u64],
         nodes: &HashSet<u64>,
         edges: &HashSet<(u64, u64)>,
         component_index: &HashMap<u64, usize>,
         state_key: &HashMap<u64, u8>,
     ) -> HashSet<(u64, u64)> {
+        let adjacency = Self::build_adjacency(nodes, edges);
         let mut txs_by_key: HashMap<u8, Vec<u64>> = HashMap::new();
-        for &tx_id in nodes {
-            if let Some(&key) = state_key.get(&tx_id) {
-                txs_by_key.entry(key).or_default().push(tx_id);
+        for &tx_id in ordered_tx_ids {
+            if nodes.contains(&tx_id) {
+                if let Some(&key) = state_key.get(&tx_id) {
+                    txs_by_key.entry(key).or_default().push(tx_id);
+                }
             }
         }
 
         let mut missing_edges = HashSet::new();
-        for tx_ids in txs_by_key.values_mut() {
-            tx_ids.sort_unstable();
-            for (index, &left) in tx_ids.iter().enumerate() {
-                for &right in tx_ids.iter().skip(index + 1) {
-                    if component_index.get(&left) == component_index.get(&right) {
-                        continue;
-                    }
-                    if edges.contains(&(left, right)) || edges.contains(&(right, left)) {
-                        continue;
-                    }
-                    missing_edges.insert((left, right));
+        for tx_ids in txs_by_key.values() {
+            let mut frontier = None;
+            for &current in tx_ids {
+                let Some(previous) = frontier else {
+                    frontier = Some(current);
+                    continue;
+                };
+
+                if component_index.get(&previous) == component_index.get(&current)
+                    || Self::has_path_in_adjacency(previous, current, &adjacency)
+                    || Self::has_path_in_adjacency(current, previous, &adjacency)
+                {
+                    frontier = Some(current);
+                    continue;
                 }
+
+                missing_edges.insert((previous, current));
+                frontier = Some(current);
             }
         }
 
