@@ -81,8 +81,12 @@ class LogParser:
         self.local_graph_times = self._merge_results([
             x.items() for x in local_graph_times
         ])
+        # Keep execution metrics on the same canonical digest set used by the
+        # commit-path throughput numbers. Otherwise, a canonical worker would
+        # log execution for every committed digest with its worker id, which
+        # inflates execution TPS above the user input rate.
         self.executed_sizes = {
-            k: v for x in executed_sizes for k, v in x.items() if k in self.commits
+            k: v for x in executed_sizes for k, v in x.items() if k in self.sizes
         }
         self.executed_times = self._merge_results([
             x.items() for x in executed_times
