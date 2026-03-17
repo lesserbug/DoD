@@ -82,7 +82,6 @@ struct ParsedStandardTx {
 
 #[derive(Clone, Debug)]
 struct KnownTx {
-    transaction: Transaction,
     first_seen_sequence: u64,
     last_seen_sequence: u64,
 }
@@ -145,10 +144,16 @@ pub struct BatchMaker {
     current_batch_size: usize,
     /// A network sender to broadcast the batches to the other workers.
     network: ReliableSender,
-    /// Standard transactions that this worker has seen recently.
+    /// Records the latest writer transaction id for each key across sealed
+    /// local graphs. This is the stable cross-batch predecessor evidence used
+    /// by the current DoD worker pipeline.
+    last_writer: HashMap<u8, u64>,
+    /// Standard transactions that this worker has seen recently. This is kept
+    /// as light metadata only; until phase 5 exists, feedback observations
+    /// must stay off the local-order hot path.
     known_transactions: HashMap<u64, KnownTx>,
-    /// Transactions that remain unresolved and should be reintroduced into
-    /// future local-order graphs.
+    /// Transactions that remain unresolved according to recent global-order
+    /// observations. This is currently sidecar state only.
     retained_unresolved: BTreeSet<u64>,
     /// A bounded local skeleton of `M_w`, currently tracking unresolved pairs
     /// derived from recent global-order messages.
@@ -183,6 +188,7 @@ impl BatchMaker {
                 current_batch: Vec::with_capacity(batch_size * 2),
                 current_batch_size: 0,
                 network: ReliableSender::new(),
+                last_writer: HashMap::new(),
                 known_transactions: HashMap::new(),
                 retained_unresolved: BTreeSet::new(),
                 missing_edge_store: HashMap::new(),
@@ -203,7 +209,7 @@ impl BatchMaker {
                 // Assemble client transactions into batches of preset size.
                 Some(transaction) = self.rx_transaction.recv() => {
                     if let Some((tx_id, _)) = parse_standard_transaction(&transaction) {
-                        self.record_known_transaction(self.next_sequence, tx_id, transaction.clone());
+                        self.record_known_transaction(self.next_sequence, tx_id);
                     }
                     self.current_batch_size += transaction.len();
                     self.current_batch.push(transaction);
@@ -265,6 +271,12 @@ impl BatchMaker {
         let mut edge_set = HashSet::new();
         let mut batch_writers: HashMap<u8, Vec<u64>> = HashMap::new();
         for tx in &standard_txs {
+            if let Some(&prev_tx_id) = self.last_writer.get(&tx.state_key) {
+                if prev_tx_id != tx.tx_id {
+                    edge_set.insert((prev_tx_id, tx.tx_id));
+                }
+            }
+
             let prior_writers = batch_writers.entry(tx.state_key).or_default();
             for &prev_tx_id in prior_writers.iter() {
                 if prev_tx_id != tx.tx_id {
@@ -273,6 +285,12 @@ impl BatchMaker {
             }
             if !prior_writers.contains(&tx.tx_id) {
                 prior_writers.push(tx.tx_id);
+            }
+        }
+
+        for (state_key, writers) in batch_writers {
+            if let Some(&latest_tx_id) = writers.last() {
+                self.last_writer.insert(state_key, latest_tx_id);
             }
         }
 
@@ -360,15 +378,13 @@ impl BatchMaker {
             .collect();
     }
 
-    fn record_known_transaction(&mut self, sequence: u64, tx_id: u64, transaction: Transaction) {
+    fn record_known_transaction(&mut self, sequence: u64, tx_id: u64) {
         self.known_transactions
             .entry(tx_id)
             .and_modify(|known| {
-                known.transaction = transaction.clone();
                 known.last_seen_sequence = sequence;
             })
             .or_insert(KnownTx {
-                transaction,
                 first_seen_sequence: sequence,
                 last_seen_sequence: sequence,
             });

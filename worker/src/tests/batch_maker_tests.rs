@@ -184,7 +184,7 @@ async fn local_order_links_to_all_prior_conflicting_txs() {
 }
 
 #[tokio::test]
-async fn local_order_does_not_rebroadcast_unresolved_transactions_without_execution_feedback() {
+async fn local_order_keeps_cross_batch_last_writer_without_rebroadcasting_unresolved_txs() {
     let (tx_transaction, rx_transaction) = channel(3);
     let (tx_control, rx_control) = channel(4);
     let (tx_message, mut rx_message) = channel(3);
@@ -229,7 +229,7 @@ async fn local_order_does_not_rebroadcast_unresolved_transactions_without_execut
         WorkerMessage::LocalBatch(batch) => {
             assert_eq!(batch.sequence, 1);
             assert_eq!(batch_tx_ids(&batch), vec![43]);
-            assert!(batch.edges.is_empty());
+            assert_eq!(batch.edges, vec![(42, 43)]);
         }
         _ => panic!("Unexpected message"),
     }
@@ -255,14 +255,14 @@ async fn local_order_does_not_rebroadcast_unresolved_transactions_without_execut
         WorkerMessage::LocalBatch(batch) => {
             assert_eq!(batch.sequence, 2);
             assert_eq!(batch_tx_ids(&batch), vec![44]);
-            assert!(batch.edges.is_empty());
+            assert_eq!(batch.edges, vec![(43, 44)]);
         }
         _ => panic!("Unexpected message"),
     }
 }
 
 #[tokio::test]
-async fn local_order_stops_reintroducing_transactions_after_observed_resolution() {
+async fn global_graph_observations_do_not_override_last_writer_order() {
     let (tx_transaction, rx_transaction) = channel(3);
     let (tx_control, rx_control) = channel(4);
     let (tx_message, mut rx_message) = channel(1);
@@ -318,7 +318,7 @@ async fn local_order_stops_reintroducing_transactions_after_observed_resolution(
         WorkerMessage::LocalBatch(batch) => {
             assert_eq!(batch.sequence, 2);
             assert_eq!(batch_tx_ids(&batch), vec![44]);
-            assert!(batch.edges.is_empty());
+            assert_eq!(batch.edges, vec![(43, 44)]);
         }
         _ => panic!("Unexpected message"),
     }
