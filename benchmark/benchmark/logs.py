@@ -148,10 +148,10 @@ class LogParser:
         if search(r'(?:panic|Error)', log) is not None:
             raise ParseError('Worker(s) panicked')
 
-        tmp = findall(r'Batch ([^ ]+) contains (\d+) B', log)
+        tmp = findall(r'(?<!\w)Batch ([^ ]+) contains (\d+) B', log)
         sizes = {d: int(s) for d, s in tmp}
 
-        tmp = findall(r'Batch ([^ ]+) contains sample tx (\d+)', log)
+        tmp = findall(r'(?<!\w)Batch ([^ ]+) contains sample tx (\d+)', log)
         samples = {}
         for d, s in tmp:
             samples.setdefault(int(s), set()).add(d)
