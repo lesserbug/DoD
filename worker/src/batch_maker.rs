@@ -10,7 +10,7 @@ use ed25519_dalek::{Digest as _, Sha512};
 #[cfg(feature = "benchmark")]
 use log::info;
 use network::ReliableSender;
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 #[cfg(feature = "benchmark")]
 use std::convert::TryInto as _;
 use std::net::SocketAddr;
@@ -32,6 +32,9 @@ pub struct Batch {
     // Within one local graph we keep every earlier conflicting transaction,
     // while across graphs we only carry the latest known predecessor.
     pub edges: Vec<(u64, u64)>,
+    // Missing dependency pairs carried without re-broadcasting old payloads.
+    // Pairs emitted by the local worker keep the historical predecessor first;
+    // pairs synthesized by global ordering remain unresolved same-round pairs.
     #[serde(default)]
     pub missing_edges: Vec<(u64, u64)>,
 }
@@ -159,11 +162,20 @@ pub struct BatchMaker {
     /// here so the Processed feedback loop does not retain payloads in the hot
     /// path.
     unprocessed_by_key: HashMap<u8, Vec<u64>>,
+    /// Lightweight `M_w`: recent unresolved pairs touching locally known
+    /// transactions, indexed by local tx id and bounded by age/size.
+    missing_partners_by_tx: HashMap<u64, Vec<u64>>,
+    missing_pairs: HashSet<(u64, u64)>,
+    missing_pair_fifo: VecDeque<(u64, (u64, u64))>,
     /// Sequence number of the next local-order graph.
     next_sequence: u64,
 }
 
 impl BatchMaker {
+    const MAX_CONTROL_MESSAGES_PER_TICK: usize = 64;
+    const MAX_MISSING_PAIRS: usize = 4_096;
+    const MAX_MISSING_PAIR_AGE: u64 = 128;
+
     pub fn spawn(
         name: PublicKey,
         batch_size: usize,
@@ -188,6 +200,9 @@ impl BatchMaker {
                 last_writer: HashMap::new(),
                 known_transactions: HashMap::new(),
                 unprocessed_by_key: HashMap::new(),
+                missing_partners_by_tx: HashMap::new(),
+                missing_pairs: HashSet::new(),
+                missing_pair_fifo: VecDeque::new(),
                 next_sequence: 0,
             }
             .run()
@@ -212,10 +227,6 @@ impl BatchMaker {
                     }
                 },
 
-                Some(control) = self.rx_control.recv() => {
-                    self.handle_control(control);
-                },
-
                 // If the timer triggers, seal the batch even if it contains few transactions.
                 () = &mut timer => {
                     if !self.current_batch.is_empty() {
@@ -225,6 +236,8 @@ impl BatchMaker {
                 }
             }
 
+            self.drain_control_backlog(Self::MAX_CONTROL_MESSAGES_PER_TICK);
+
             // Give the chance to schedule other tasks.
             tokio::task::yield_now().await;
         }
@@ -232,7 +245,7 @@ impl BatchMaker {
 
     /// Seal and broadcast the current batch.
     async fn seal(&mut self) {
-        self.drain_control_backlog();
+        self.drain_control_backlog(Self::MAX_CONTROL_MESSAGES_PER_TICK);
 
         #[cfg(feature = "benchmark")]
         let size = self.current_batch_size;
@@ -258,11 +271,23 @@ impl BatchMaker {
             .collect();
 
         let mut edge_set = HashSet::new();
+        let mut missing_edge_set = HashSet::new();
         let mut batch_writers: HashMap<u8, Vec<u64>> = HashMap::new();
         for tx in &standard_txs {
             if let Some(&prev_tx_id) = self.last_writer.get(&tx.state_key) {
                 if prev_tx_id != tx.tx_id {
                     edge_set.insert((prev_tx_id, tx.tx_id));
+                }
+            }
+
+            if let Some(prior_unprocessed) = self.unprocessed_by_key.get(&tx.state_key) {
+                for &prev_tx_id in prior_unprocessed {
+                    if prev_tx_id != tx.tx_id
+                        && !edge_set.contains(&(prev_tx_id, tx.tx_id))
+                        && self.has_missing_partners(prev_tx_id)
+                    {
+                        missing_edge_set.insert((prev_tx_id, tx.tx_id));
+                    }
                 }
             }
 
@@ -289,13 +314,15 @@ impl BatchMaker {
 
         let mut edges: Vec<_> = edge_set.into_iter().collect();
         edges.sort_unstable();
+        let mut missing_edges: Vec<_> = missing_edge_set.into_iter().collect();
+        missing_edges.sort_unstable();
 
         let batch = Batch {
             author: self.name,
             sequence,
             transactions,
             edges,
-            missing_edges: Vec::new(),
+            missing_edges,
         };
         self.next_sequence += 1;
 
@@ -334,15 +361,18 @@ impl BatchMaker {
             .expect("Failed to deliver batch");
     }
 
-    fn drain_control_backlog(&mut self) {
-        while let Ok(control) = self.rx_control.try_recv() {
+    fn drain_control_backlog(&mut self, budget: usize) {
+        for _ in 0..budget {
+            let Ok(control) = self.rx_control.try_recv() else {
+                break;
+            };
             self.handle_control(control);
         }
     }
 
     fn handle_control(&mut self, control: BatchMakerControl) {
         match control {
-            BatchMakerControl::ObserveGlobalGraph(_) => {}
+            BatchMakerControl::ObserveGlobalGraph(info) => self.observe_global_graph(info),
             BatchMakerControl::MarkProcessed(tx_ids) => self.mark_processed(tx_ids),
         }
     }
@@ -356,6 +386,89 @@ impl BatchMaker {
         }
     }
 
+    fn observe_global_graph(&mut self, info: GlobalGraphInfo) {
+        self.prune_missing_pairs(info.sequence);
+
+        for pair in info.missing_edges {
+            let (left, right) = pair;
+            if !self.known_transactions.contains_key(&left)
+                && !self.known_transactions.contains_key(&right)
+            {
+                continue;
+            }
+
+            self.insert_missing_pair(info.sequence, (left, right));
+        }
+    }
+
+    fn insert_missing_pair(&mut self, sequence: u64, pair: (u64, u64)) {
+        if pair.0 == pair.1 || !self.missing_pairs.insert(pair) {
+            return;
+        }
+
+        self.missing_pair_fifo.push_back((sequence, pair));
+        self.record_missing_partner(pair.0, pair.1);
+        self.record_missing_partner(pair.1, pair.0);
+        self.prune_missing_pairs(sequence);
+    }
+
+    fn record_missing_partner(&mut self, tx_id: u64, partner: u64) {
+        if !self.known_transactions.contains_key(&tx_id) {
+            return;
+        }
+
+        let partners = self.missing_partners_by_tx.entry(tx_id).or_default();
+        if !partners.contains(&partner) {
+            partners.push(partner);
+        }
+    }
+
+    fn has_missing_partners(&self, tx_id: u64) -> bool {
+        self.missing_partners_by_tx
+            .get(&tx_id)
+            .map_or(false, |partners| !partners.is_empty())
+    }
+
+    fn prune_missing_pairs(&mut self, current_sequence: u64) {
+        loop {
+            let Some(&(sequence, pair)) = self.missing_pair_fifo.front() else {
+                break;
+            };
+
+            let too_many = self.missing_pairs.len() > Self::MAX_MISSING_PAIRS;
+            let too_old = current_sequence.saturating_sub(sequence) > Self::MAX_MISSING_PAIR_AGE;
+            if !too_many && !too_old {
+                break;
+            }
+
+            self.missing_pair_fifo.pop_front();
+            self.remove_missing_pair(pair);
+        }
+    }
+
+    fn remove_missing_pair(&mut self, pair: (u64, u64)) {
+        if !self.missing_pairs.remove(&pair) {
+            return;
+        }
+
+        self.remove_missing_partner(pair.0, pair.1);
+        self.remove_missing_partner(pair.1, pair.0);
+    }
+
+    fn remove_missing_partner(&mut self, tx_id: u64, partner: u64) {
+        let should_remove = match self.missing_partners_by_tx.get_mut(&tx_id) {
+            Some(partners) => {
+                partners.retain(|candidate| *candidate != partner);
+                partners.is_empty()
+            }
+            None => false,
+        };
+
+        if should_remove {
+            self.missing_partners_by_tx.remove(&tx_id);
+        }
+    }
+
     fn mark_processed(&mut self, tx_ids: Vec<u64>) {
         let mut touched_keys = HashSet::new();
 
@@ -366,6 +479,7 @@ impl BatchMaker {
                     unprocessed.retain(|candidate| *candidate != tx_id);
                 }
             }
+            self.remove_all_missing_pairs_for(tx_id);
         }
 
         for state_key in touched_keys {
@@ -377,5 +491,18 @@ impl BatchMaker {
                 self.unprocessed_by_key.remove(&state_key);
             }
         }
+    }
+
+    fn remove_all_missing_pairs_for(&mut self, tx_id: u64) {
+        let Some(partners) = self.missing_partners_by_tx.get(&tx_id).cloned() else {
+            return;
+        };
+
+        for partner in partners {
+            let pair = canonical_missing_edge(tx_id, partner);
+            self.remove_missing_pair(pair);
+        }
+
+        self.missing_partners_by_tx.remove(&tx_id);
     }
 }

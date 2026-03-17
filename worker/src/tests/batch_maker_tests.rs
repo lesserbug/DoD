@@ -2,7 +2,7 @@
 use super::*;
 use crate::common::transaction;
 use network::ReliableSender;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet, VecDeque};
 use tokio::sync::mpsc::channel;
 
 fn standard_transaction(id: u64, state_key: u8) -> Transaction {
@@ -254,6 +254,131 @@ async fn local_order_keeps_cross_batch_last_writer_without_rebroadcasting_unreso
     }
 }
 
+#[tokio::test]
+async fn observe_global_graph_turns_ambiguous_unprocessed_txs_into_local_missing_edges() {
+    let (tx_transaction, rx_transaction) = channel(4);
+    let (tx_control, rx_control) = channel(4);
+    let (tx_message, mut rx_message) = channel(4);
+    let dummy_addresses = vec![(PublicKey::default(), "127.0.0.1:0".parse().unwrap())];
+
+    BatchMaker::spawn(
+        PublicKey::default(),
+        /* max_batch_size */ 100,
+        /* max_batch_delay */ 1_000_000,
+        rx_transaction,
+        rx_control,
+        tx_message,
+        dummy_addresses,
+    );
+
+    tx_transaction
+        .send(standard_transaction(41, 9))
+        .await
+        .unwrap();
+    let _ = rx_message.recv().await.unwrap();
+
+    tx_transaction
+        .send(standard_transaction(42, 9))
+        .await
+        .unwrap();
+    let _ = rx_message.recv().await.unwrap();
+
+    let observed_batch = Batch {
+        author: PublicKey::default(),
+        sequence: 0,
+        transactions: vec![standard_transaction(41, 9), standard_transaction(500, 9)],
+        edges: Vec::new(),
+        missing_edges: vec![(41, 500)],
+    };
+    tx_control
+        .send(BatchMakerControl::observe_global_batch(&observed_batch))
+        .await
+        .unwrap();
+
+    tx_transaction
+        .send(standard_transaction(43, 9))
+        .await
+        .unwrap();
+
+    let QuorumWaiterMessage {
+        batch: third_batch,
+        handlers: _,
+    } = rx_message.recv().await.unwrap();
+    match bincode::deserialize(&third_batch).unwrap() {
+        WorkerMessage::LocalBatch(batch) => {
+            assert_eq!(batch.sequence, 2);
+            assert_eq!(batch_tx_ids(&batch), vec![43]);
+            assert_eq!(batch.edges, vec![(42, 43)]);
+            assert_eq!(batch.missing_edges, vec![(41, 43)]);
+        }
+        _ => panic!("Unexpected message"),
+    }
+}
+
+#[tokio::test]
+async fn processed_feedback_clears_local_missing_edge_carry_over() {
+    let (tx_transaction, rx_transaction) = channel(4);
+    let (tx_control, rx_control) = channel(4);
+    let (tx_message, mut rx_message) = channel(4);
+    let dummy_addresses = vec![(PublicKey::default(), "127.0.0.1:0".parse().unwrap())];
+
+    BatchMaker::spawn(
+        PublicKey::default(),
+        /* max_batch_size */ 100,
+        /* max_batch_delay */ 1_000_000,
+        rx_transaction,
+        rx_control,
+        tx_message,
+        dummy_addresses,
+    );
+
+    tx_transaction
+        .send(standard_transaction(41, 9))
+        .await
+        .unwrap();
+    let _ = rx_message.recv().await.unwrap();
+
+    tx_transaction
+        .send(standard_transaction(42, 9))
+        .await
+        .unwrap();
+    let _ = rx_message.recv().await.unwrap();
+
+    let observed_batch = Batch {
+        author: PublicKey::default(),
+        sequence: 0,
+        transactions: vec![standard_transaction(41, 9), standard_transaction(500, 9)],
+        edges: Vec::new(),
+        missing_edges: vec![(41, 500)],
+    };
+    tx_control
+        .send(BatchMakerControl::observe_global_batch(&observed_batch))
+        .await
+        .unwrap();
+    tx_control
+        .send(BatchMakerControl::mark_processed(vec![41]))
+        .await
+        .unwrap();
+
+    tx_transaction
+        .send(standard_transaction(43, 9))
+        .await
+        .unwrap();
+
+    let QuorumWaiterMessage {
+        batch: third_batch,
+        handlers: _,
+    } = rx_message.recv().await.unwrap();
+    match bincode::deserialize(&third_batch).unwrap() {
+        WorkerMessage::LocalBatch(batch) => {
+            assert_eq!(batch.sequence, 2);
+            assert_eq!(batch.edges, vec![(42, 43)]);
+            assert!(batch.missing_edges.is_empty());
+        }
+        _ => panic!("Unexpected message"),
+    }
+}
+
 #[test]
 fn observe_global_batch_canonicalizes_missing_edges() {
     let batch = Batch {
@@ -298,6 +423,9 @@ fn processed_feedback_prunes_unprocessed_state_without_retaining_payloads() {
         last_writer: HashMap::new(),
         known_transactions: HashMap::new(),
         unprocessed_by_key: HashMap::new(),
+        missing_partners_by_tx: HashMap::new(),
+        missing_pairs: HashSet::new(),
+        missing_pair_fifo: VecDeque::new(),
         next_sequence: 0,
     };
 

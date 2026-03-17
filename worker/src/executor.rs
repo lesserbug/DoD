@@ -9,7 +9,7 @@ use crypto::Digest;
 #[cfg(feature = "benchmark")]
 use log::info;
 use log::warn;
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 #[cfg(feature = "benchmark")]
 use std::convert::TryInto as _;
 use store::Store;
@@ -18,6 +18,11 @@ use tokio::sync::mpsc::{Receiver, Sender};
 #[cfg(test)]
 #[path = "tests/executor_tests.rs"]
 pub mod executor_tests;
+
+struct PendingBatch {
+    digest: Digest,
+    batch: Batch,
+}
 
 /// Executes globally ordered batches once the primary feeds back their ordered
 /// digests. This is the worker-side skeleton of DoD Algorithm 3.
@@ -32,11 +37,22 @@ pub struct Executor {
     tx_batch_control: Sender<BatchMakerControl>,
     /// Avoid re-executing the same committed digest.
     executed: HashSet<Digest>,
+    /// Recent processed tx ids, kept long enough to release queued batches with
+    /// cross-batch missing predecessors.
+    processed_tx_ids: HashSet<u64>,
+    processed_fifo: VecDeque<u64>,
+    /// Ordered global batches waiting for external missing predecessors to be
+    /// marked as processed locally.
+    pending_batches: VecDeque<PendingBatch>,
     /// Whether to emit benchmark execution logs.
     benchmark_log_batches: bool,
 }
 
 impl Executor {
+    /// The maximum number of processed tx ids retained for resolving
+    /// carry-over missing predecessors.
+    const MAX_PROCESSED_TX_IDS: usize = 65_536;
+
     pub fn spawn(
         id: WorkerId,
         store: Store,
@@ -51,6 +67,9 @@ impl Executor {
                 rx_execute,
                 tx_batch_control,
                 executed: HashSet::new(),
+                processed_tx_ids: HashSet::new(),
+                processed_fifo: VecDeque::new(),
+                pending_batches: VecDeque::new(),
                 benchmark_log_batches,
             }
             .run()
@@ -94,22 +113,38 @@ impl Executor {
                     }
                 };
 
-                let executed_transactions = Self::execute_batch(&batch);
-                let processed_tx_ids = Self::collect_processed_tx_ids(&executed_transactions);
-                if !processed_tx_ids.is_empty() {
-                    self.tx_batch_control
-                        .send(BatchMakerControl::mark_processed(processed_tx_ids))
-                        .await
-                        .expect("Failed to send processed feedback to batch maker");
+                if !batch.missing_edges.is_empty() {
+                    let _ = self
+                        .tx_batch_control
+                        .try_send(BatchMakerControl::observe_global_batch(&batch));
                 }
-                #[cfg(not(feature = "benchmark"))]
-                let _ = (&executed_transactions, self.benchmark_log_batches);
-                #[cfg(feature = "benchmark")]
-                if self.benchmark_log_batches {
-                    Self::log_executed_batch(&digest, &executed_transactions);
+
+                if Self::batch_ready(&batch, &self.processed_tx_ids) {
+                    self.execute_and_feedback(digest, batch).await;
+                    self.retry_pending_batches().await;
+                } else {
+                    self.pending_batches
+                        .push_back(PendingBatch { digest, batch });
                 }
             }
         }
+    }
+
+    fn batch_ready(batch: &Batch, processed_tx_ids: &HashSet<u64>) -> bool {
+        let positions: HashSet<_> = batch
+            .transactions
+            .iter()
+            .filter_map(|tx| parse_transaction_id_and_state_key(tx).map(|(tx_id, _)| tx_id))
+            .collect();
+
+        batch.missing_edges.iter().all(|(left, right)| {
+            match (positions.contains(left), positions.contains(right)) {
+                (true, true) => true,
+                (true, false) => processed_tx_ids.contains(right),
+                (false, true) => processed_tx_ids.contains(left),
+                (false, false) => true,
+            }
+        })
     }
 
     fn execute_batch(batch: &Batch) -> Vec<Transaction> {
@@ -146,8 +181,9 @@ impl Executor {
             }
         }
 
-        // Until the full M_w / processed feedback loop exists, we deterministically
-        // orient the remaining missing pairs by the already finalized batch order.
+        // Cross-batch missing predecessors are handled by the local execution
+        // queue before we reach this point. For same-batch ambiguous pairs we
+        // still keep the finalized batch order as a deterministic tie-breaker.
         for &(left, right) in &batch.missing_edges {
             if let (Some(&left_index), Some(&right_index)) =
                 (positions.get(&left), positions.get(&right))
@@ -196,6 +232,69 @@ impl Executor {
         }
 
         ordered
+    }
+
+    async fn execute_and_feedback(&mut self, digest: Digest, batch: Batch) {
+        let executed_transactions = Self::execute_batch(&batch);
+        let processed_tx_ids = Self::collect_processed_tx_ids(&executed_transactions);
+        self.remember_processed(&processed_tx_ids);
+
+        if !processed_tx_ids.is_empty() {
+            self.tx_batch_control
+                .send(BatchMakerControl::mark_processed(processed_tx_ids))
+                .await
+                .expect("Failed to send processed feedback to batch maker");
+        }
+
+        #[cfg(not(feature = "benchmark"))]
+        let _ = (&executed_transactions, self.benchmark_log_batches, digest);
+        #[cfg(feature = "benchmark")]
+        if self.benchmark_log_batches {
+            Self::log_executed_batch(&digest, &executed_transactions);
+        }
+    }
+
+    async fn retry_pending_batches(&mut self) {
+        loop {
+            let pending_len = self.pending_batches.len();
+            if pending_len == 0 {
+                break;
+            }
+
+            let mut progressed = false;
+            for _ in 0..pending_len {
+                let pending = self
+                    .pending_batches
+                    .pop_front()
+                    .expect("pending batch queue length changed unexpectedly");
+
+                if Self::batch_ready(&pending.batch, &self.processed_tx_ids) {
+                    self.execute_and_feedback(pending.digest, pending.batch)
+                        .await;
+                    progressed = true;
+                } else {
+                    self.pending_batches.push_back(pending);
+                }
+            }
+
+            if !progressed {
+                break;
+            }
+        }
+    }
+
+    fn remember_processed(&mut self, tx_ids: &[u64]) {
+        for &tx_id in tx_ids {
+            if self.processed_tx_ids.insert(tx_id) {
+                self.processed_fifo.push_back(tx_id);
+            }
+        }
+
+        while self.processed_fifo.len() > Self::MAX_PROCESSED_TX_IDS {
+            if let Some(oldest) = self.processed_fifo.pop_front() {
+                self.processed_tx_ids.remove(&oldest);
+            }
+        }
     }
 
     fn collect_processed_tx_ids(transactions: &[Transaction]) -> Vec<u64> {

@@ -360,6 +360,7 @@ impl GlobalOrderer {
         let component_index = Self::component_index(&sccs);
         let missing_edges =
             Self::collect_missing_edges(&nodes, &edges, &component_index, &state_key);
+        let forwarded_missing_edges = Self::collect_forwarded_missing_edges(&local_graphs, &nodes);
         Self::linearize_sccs(&mut edges, &sccs);
 
         let reduced_edges = Self::transitive_reduction(&nodes, &edges);
@@ -379,7 +380,13 @@ impl GlobalOrderer {
             .into_iter()
             .filter(|(from, to)| nodes.contains(from) && nodes.contains(to) && from != to)
             .collect();
+        final_missing_edges.extend(
+            forwarded_missing_edges
+                .into_iter()
+                .filter(|(from, to)| (nodes.contains(from) || nodes.contains(to)) && from != to),
+        );
         final_missing_edges.sort_unstable();
+        final_missing_edges.dedup();
 
         Batch {
             author: name,
@@ -572,6 +579,28 @@ impl GlobalOrderer {
                         continue;
                     }
                     missing_edges.insert((left, right));
+                }
+            }
+        }
+
+        missing_edges
+    }
+
+    fn collect_forwarded_missing_edges(
+        local_graphs: &[Batch],
+        nodes: &HashSet<u64>,
+    ) -> HashSet<(u64, u64)> {
+        let mut missing_edges = HashSet::new();
+
+        for graph in local_graphs {
+            let mut seen = HashSet::new();
+            for &(from, to) in &graph.missing_edges {
+                if from == to || !(nodes.contains(&from) || nodes.contains(&to)) {
+                    continue;
+                }
+
+                if seen.insert((from, to)) {
+                    missing_edges.insert((from, to));
                 }
             }
         }

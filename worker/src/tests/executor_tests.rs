@@ -1,6 +1,7 @@
 // Copyright(C) Facebook, Inc. and its affiliates.
 use super::*;
 use crypto::PublicKey;
+use std::collections::HashSet;
 
 fn standard_transaction(id: u64, state_key: u8) -> Transaction {
     let mut tx = Vec::with_capacity(100);
@@ -70,4 +71,21 @@ fn processed_feedback_only_tracks_standard_transactions() {
     ]);
 
     assert_eq!(tx_ids, vec![2, 3]);
+}
+
+#[test]
+fn queues_batches_with_unprocessed_external_missing_predecessors() {
+    let batch = Batch {
+        author: PublicKey::default(),
+        sequence: 3,
+        transactions: vec![standard_transaction(43, 9)],
+        edges: Vec::new(),
+        missing_edges: vec![(41, 43)],
+    };
+
+    assert!(!Executor::batch_ready(&batch, &HashSet::new()));
+
+    let mut processed = HashSet::new();
+    processed.insert(41);
+    assert!(Executor::batch_ready(&batch, &processed));
 }

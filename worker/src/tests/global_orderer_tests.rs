@@ -33,12 +33,22 @@ fn make_custom_local_graph(
     transactions: Vec<Transaction>,
     edges: Vec<(u64, u64)>,
 ) -> SerializedBatchMessage {
+    make_custom_local_graph_with_missing_edges(author, sequence, transactions, edges, Vec::new())
+}
+
+fn make_custom_local_graph_with_missing_edges(
+    author: PublicKey,
+    sequence: u64,
+    transactions: Vec<Transaction>,
+    edges: Vec<(u64, u64)>,
+    missing_edges: Vec<(u64, u64)>,
+) -> SerializedBatchMessage {
     let batch = Batch {
         author,
         sequence,
         transactions,
         edges,
-        missing_edges: Vec::new(),
+        missing_edges,
     };
     bincode::serialize(&WorkerMessage::LocalBatch(batch)).unwrap()
 }
@@ -268,6 +278,61 @@ async fn records_missing_edges_when_support_is_ambiguous() {
         WorkerMessage::GlobalBatch(batch) => {
             assert!(batch.edges.is_empty());
             assert_eq!(batch.missing_edges, vec![(1, 2)]);
+        }
+        other => panic!("Unexpected worker message: {:?}", other),
+    }
+}
+
+#[tokio::test]
+async fn forwards_local_missing_predecessors_into_global_batch() {
+    let (name, _) = keys().pop().unwrap();
+    let committee = committee_with_base_port(14_250);
+    let peers: Vec<_> = committee
+        .others_workers(&name, &0)
+        .into_iter()
+        .map(|(peer, _)| peer)
+        .take(2)
+        .collect();
+
+    let (tx_own, rx_own) = channel(10);
+    let (tx_workers, rx_workers) = channel(10);
+    let (tx_global, mut rx_global) = channel(10);
+
+    GlobalOrderer::spawn(name, committee, rx_own, rx_workers, tx_global, vec![]);
+
+    tx_own
+        .send(make_custom_local_graph_with_missing_edges(
+            name,
+            0,
+            vec![standard_transaction(43, 5)],
+            vec![],
+            vec![(41, 43)],
+        ))
+        .await
+        .unwrap();
+
+    for peer in peers {
+        tx_workers
+            .send(make_custom_local_graph_with_missing_edges(
+                peer,
+                0,
+                vec![standard_transaction(43, 5)],
+                vec![],
+                vec![(41, 43)],
+            ))
+            .await
+            .unwrap();
+    }
+
+    let serialized = rx_global
+        .recv()
+        .await
+        .expect("Global orderer did not output a global graph");
+
+    match bincode::deserialize(&serialized).unwrap() {
+        WorkerMessage::GlobalBatch(batch) => {
+            assert_eq!(tx_ids(&batch), vec![43]);
+            assert_eq!(batch.missing_edges, vec![(41, 43)]);
         }
         other => panic!("Unexpected worker message: {:?}", other),
     }
