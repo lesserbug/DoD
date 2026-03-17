@@ -6,7 +6,6 @@ use crate::batch_maker::{
 use crate::worker::WorkerMessage;
 use config::WorkerId;
 use crypto::Digest;
-use log::debug;
 #[cfg(feature = "benchmark")]
 use log::info;
 use log::warn;
@@ -82,6 +81,7 @@ impl Executor {
     const MAX_PENDING_BATCHES_SOFT: usize = 4_096;
     const MAX_PENDING_SEQUENCE_LAG_SOFT: u64 = 256;
     const HEALTH_LOG_INTERVAL: u64 = 64;
+    const BENCHMARK_HEALTH_LOG_INTERVAL: u64 = 1_024;
 
     pub fn spawn(
         id: WorkerId,
@@ -383,6 +383,10 @@ impl Executor {
     }
 
     fn summarize_missing_edges(batch: &Batch) -> MissingEdgeSummary {
+        if batch.missing_edges.is_empty() {
+            return MissingEdgeSummary::default();
+        }
+
         let positions: HashSet<_> = batch
             .transactions
             .iter()
@@ -491,12 +495,6 @@ impl Executor {
         let unhealthy = self.pending_batches.len() > Self::MAX_PENDING_BATCHES_SOFT
             || oldest_lag > Self::MAX_PENDING_SEQUENCE_LAG_SOFT;
         if !unhealthy {
-            debug!(
-                "Executor pending queue length={}, oldest_lag={}, max_stalled_rounds={}",
-                self.pending_batches.len(),
-                oldest_lag,
-                max_stalled_rounds
-            );
             return;
         }
 
@@ -514,7 +512,12 @@ impl Executor {
     }
 
     fn should_log_event(&self, count: u64) -> bool {
-        count == 1 || count % Self::HEALTH_LOG_INTERVAL == 0
+        let interval = if cfg!(feature = "benchmark") {
+            Self::BENCHMARK_HEALTH_LOG_INTERVAL
+        } else {
+            Self::HEALTH_LOG_INTERVAL
+        };
+        count == 1 || count % interval == 0
     }
 
     fn record_same_batch_fallback(
