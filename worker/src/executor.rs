@@ -14,6 +14,7 @@ use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::convert::TryInto as _;
 use store::Store;
 use tokio::sync::mpsc::{error::TrySendError, Receiver, Sender};
+use tokio::time::{interval, Duration};
 
 #[cfg(test)]
 #[path = "tests/executor_tests.rs"]
@@ -82,6 +83,7 @@ impl Executor {
     const MAX_PENDING_SEQUENCE_LAG_SOFT: u64 = 256;
     const HEALTH_LOG_INTERVAL: u64 = 64;
     const BENCHMARK_HEALTH_LOG_INTERVAL: u64 = 1_024;
+    const METRICS_REPORT_INTERVAL_SECS: u64 = 5;
 
     pub fn spawn(
         id: WorkerId,
@@ -115,74 +117,87 @@ impl Executor {
     }
 
     async fn run(&mut self) {
-        while let Some(ordered_batches) = self.rx_execute.recv().await {
-            for (digest, worker_id) in ordered_batches {
-                if worker_id != self.id || !self.executed.insert(digest.clone()) {
-                    continue;
-                }
+        let mut metrics_tick = interval(Duration::from_secs(Self::METRICS_REPORT_INTERVAL_SECS));
 
-                let serialized = match self.store.notify_read(digest.to_vec()).await {
-                    Ok(bytes) => bytes,
-                    Err(error) => {
-                        warn!(
-                            "Executor failed to read ordered batch {}: {}",
-                            digest, error
-                        );
-                        continue;
-                    }
-                };
+        loop {
+            tokio::select! {
+                message = self.rx_execute.recv() => {
+                    let Some(ordered_batches) = message else {
+                        self.log_metrics_snapshot();
+                        break;
+                    };
+                    for (digest, worker_id) in ordered_batches {
+                        if worker_id != self.id || !self.executed.insert(digest.clone()) {
+                            continue;
+                        }
 
-                let batch = match bincode::deserialize::<WorkerMessage>(&serialized) {
-                    Ok(WorkerMessage::GlobalBatch(batch)) => batch,
-                    Ok(other) => {
-                        warn!(
-                            "Executor received unexpected stored worker message: {:?}",
-                            other
-                        );
-                        continue;
-                    }
-                    Err(error) => {
-                        warn!(
-                            "Executor failed to deserialize ordered batch {}: {}",
-                            digest, error
-                        );
-                        continue;
-                    }
-                };
-                self.latest_sequence = self.latest_sequence.max(batch.sequence);
-                let missing_edge_summary = Self::summarize_missing_edges(&batch);
-
-                if !batch.missing_edges.is_empty() {
-                    match self
-                        .tx_batch_control
-                        .try_send(BatchMakerControl::observe_global_batch(&batch))
-                    {
-                        Ok(()) => {}
-                        Err(TrySendError::Full(_)) | Err(TrySendError::Closed(_)) => {
-                            self.dropped_observations += 1;
-                            if self.should_log_event(self.dropped_observations) {
+                        let serialized = match self.store.notify_read(digest.to_vec()).await {
+                            Ok(bytes) => bytes,
+                            Err(error) => {
                                 warn!(
-                                    "Executor dropped {} global-graph observations while updating local M_w",
-                                    self.dropped_observations
+                                    "Executor failed to read ordered batch {}: {}",
+                                    digest, error
                                 );
+                                continue;
                             }
+                        };
+
+                        let batch = match bincode::deserialize::<WorkerMessage>(&serialized) {
+                            Ok(WorkerMessage::GlobalBatch(batch)) => batch,
+                            Ok(other) => {
+                                warn!(
+                                    "Executor received unexpected stored worker message: {:?}",
+                                    other
+                                );
+                                continue;
+                            }
+                            Err(error) => {
+                                warn!(
+                                    "Executor failed to deserialize ordered batch {}: {}",
+                                    digest, error
+                                );
+                                continue;
+                            }
+                        };
+                        self.latest_sequence = self.latest_sequence.max(batch.sequence);
+                        let missing_edge_summary = Self::summarize_missing_edges(&batch);
+
+                        if !batch.missing_edges.is_empty() {
+                            match self
+                                .tx_batch_control
+                                .try_send(BatchMakerControl::observe_global_batch(&batch))
+                            {
+                                Ok(()) => {}
+                                Err(TrySendError::Full(_)) | Err(TrySendError::Closed(_)) => {
+                                    self.dropped_observations += 1;
+                                    if self.should_log_event(self.dropped_observations) {
+                                        warn!(
+                                            "Executor dropped {} global-graph observations while updating local M_w",
+                                            self.dropped_observations
+                                        );
+                                    }
+                                }
+                            }
+                        }
+
+                        if Self::batch_ready(
+                            &missing_edge_summary.external_dependencies,
+                            &self.processed_tx_ids,
+                        ) {
+                            self.execute_and_feedback(
+                                digest,
+                                batch,
+                                missing_edge_summary.same_batch_pair_count,
+                            )
+                            .await;
+                            self.retry_pending_batches().await;
+                        } else {
+                            self.enqueue_pending_batch(digest, batch, missing_edge_summary);
                         }
                     }
                 }
-
-                if Self::batch_ready(
-                    &missing_edge_summary.external_dependencies,
-                    &self.processed_tx_ids,
-                ) {
-                    self.execute_and_feedback(
-                        digest,
-                        batch,
-                        missing_edge_summary.same_batch_pair_count,
-                    )
-                    .await;
-                    self.retry_pending_batches().await;
-                } else {
-                    self.enqueue_pending_batch(digest, batch, missing_edge_summary);
+                _ = metrics_tick.tick() => {
+                    self.log_metrics_snapshot();
                 }
             }
         }
@@ -540,6 +555,35 @@ impl Executor {
                 same_batch_pair_count,
                 sequence,
                 digest,
+                self.pending_batches.len(),
+            );
+        }
+    }
+
+    fn log_metrics_snapshot(&self) {
+        #[cfg(feature = "benchmark")]
+        {
+            if !self.benchmark_log_batches {
+                return;
+            }
+
+            let has_metrics = self.same_batch_fallback_batches > 0
+                || self.same_batch_fallback_pairs > 0
+                || self.dropped_observations > 0
+                || self.pending_health_events > 0
+                || self.processed_trim_blocked_events > 0
+                || !self.pending_batches.is_empty();
+            if !has_metrics {
+                return;
+            }
+
+            info!(
+                "ExecutorMetrics fallback_batches={} fallback_pairs={} dropped_observations={} pending_health_events={} processed_trim_blocked_events={} pending_batches={}",
+                self.same_batch_fallback_batches,
+                self.same_batch_fallback_pairs,
+                self.dropped_observations,
+                self.pending_health_events,
+                self.processed_trim_blocked_events,
                 self.pending_batches.len(),
             );
         }

@@ -63,6 +63,7 @@ class LogParser:
             executed_sizes,
             executed_times,
             executed_samples,
+            executor_metrics,
             workers_ips,
         ) = zip(*results)
         self.sizes = {
@@ -106,6 +107,32 @@ class LogParser:
         for samples in executed_samples:
             for tx_id, batch_ids in samples.items():
                 self.executed_samples.setdefault(tx_id, set()).update(batch_ids)
+        self.executor_metrics = {
+            'same_batch_fallback_batches': max(
+                (metrics['same_batch_fallback_batches'] for metrics in executor_metrics),
+                default=0,
+            ),
+            'same_batch_fallback_pairs': max(
+                (metrics['same_batch_fallback_pairs'] for metrics in executor_metrics),
+                default=0,
+            ),
+            'dropped_observations': max(
+                (metrics['dropped_observations'] for metrics in executor_metrics),
+                default=0,
+            ),
+            'pending_health_events': max(
+                (metrics['pending_health_events'] for metrics in executor_metrics),
+                default=0,
+            ),
+            'processed_trim_blocked_events': max(
+                (metrics['processed_trim_blocked_events'] for metrics in executor_metrics),
+                default=0,
+            ),
+            'pending_batches': max(
+                (metrics['pending_batches'] for metrics in executor_metrics),
+                default=0,
+            ),
+        }
 
         # Determine whether the primary and the workers are collocated.
         self.collocate = set(primary_ips) == set(workers_ips)
@@ -237,6 +264,39 @@ class LogParser:
         for d, s in tmp:
             executed_samples.setdefault(int(s), set()).add(d)
 
+        metrics_entries = [
+            tuple(map(int, entry))
+            for entry in findall(
+                r'ExecutorMetrics fallback_batches=(\d+) fallback_pairs=(\d+) dropped_observations=(\d+) pending_health_events=(\d+) processed_trim_blocked_events=(\d+) pending_batches=(\d+)',
+                log,
+            )
+        ]
+        if metrics_entries:
+            (
+                same_batch_fallback_batches,
+                same_batch_fallback_pairs,
+                dropped_observations,
+                pending_health_events,
+                processed_trim_blocked_events,
+                pending_batches,
+            ) = map(max, zip(*metrics_entries))
+        else:
+            same_batch_fallback_batches = 0
+            same_batch_fallback_pairs = 0
+            dropped_observations = 0
+            pending_health_events = 0
+            processed_trim_blocked_events = 0
+            pending_batches = 0
+
+        executor_metrics = {
+            'same_batch_fallback_batches': same_batch_fallback_batches,
+            'same_batch_fallback_pairs': same_batch_fallback_pairs,
+            'dropped_observations': dropped_observations,
+            'pending_health_events': pending_health_events,
+            'processed_trim_blocked_events': processed_trim_blocked_events,
+            'pending_batches': pending_batches,
+        }
+
         ip = search(r'booted on (\d+.\d+.\d+.\d+)', log).group(1)
 
         return (
@@ -248,6 +308,7 @@ class LogParser:
             executed_sizes,
             executed_times,
             executed_samples,
+            executor_metrics,
             ip,
         )
 
@@ -411,6 +472,12 @@ class LogParser:
         local_to_global_latency = self._local_to_global_latency() * 1_000
         global_to_commit_latency = self._global_to_commit_latency() * 1_000
         commit_to_execute_latency = self._commit_to_execute_latency() * 1_000
+        same_batch_fallback_batches = self.executor_metrics['same_batch_fallback_batches']
+        same_batch_fallback_pairs = self.executor_metrics['same_batch_fallback_pairs']
+        dropped_observations = self.executor_metrics['dropped_observations']
+        pending_health_events = self.executor_metrics['pending_health_events']
+        processed_trim_blocked_events = self.executor_metrics['processed_trim_blocked_events']
+        pending_batches = self.executor_metrics['pending_batches']
 
         return (
             '\n'
@@ -453,6 +520,14 @@ class LogParser:
             f' Local graph -> global graph: {round(local_to_global_latency):,} ms\n'
             f' Global graph -> commit: {round(global_to_commit_latency):,} ms\n'
             f' Commit -> execute: {round(commit_to_execute_latency):,} ms\n'
+            '\n'
+            ' + EXECUTOR:\n'
+            f' Same-batch fallback batches: {same_batch_fallback_batches:,}\n'
+            f' Same-batch fallback pairs: {same_batch_fallback_pairs:,}\n'
+            f' Dropped global-graph observations: {dropped_observations:,}\n'
+            f' Pending queue health events: {pending_health_events:,}\n'
+            f' Processed trim blocked events: {processed_trim_blocked_events:,}\n'
+            f' Pending batches (max snapshot): {pending_batches:,}\n'
             '-----------------------------------------\n'
         )
 
