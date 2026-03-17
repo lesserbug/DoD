@@ -108,6 +108,9 @@ impl Synchronizer {
             tokio::select! {
                 // Handle primary's messages.
                 Some(message) = self.rx_message.recv() => match message {
+                    PrimaryWorkerMessage::Execute(..) => {
+                        // Ordered-execution feedback is handled by the executor, not the synchronizer.
+                    },
                     PrimaryWorkerMessage::Synchronize(digests, target) => {
                         let now = SystemTime::now()
                             .duration_since(UNIX_EPOCH)

@@ -1,5 +1,6 @@
 // Copyright(C) Facebook, Inc. and its affiliates.
 mod batch_maker;
+mod executor;
 mod global_orderer;
 mod helper;
 mod primary_connector;

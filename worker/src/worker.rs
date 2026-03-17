@@ -1,5 +1,6 @@
 // Copyright(C) Facebook, Inc. and its affiliates.
 use crate::batch_maker::{Batch, BatchMaker, Transaction};
+use crate::executor::Executor;
 use crate::global_orderer::GlobalOrderer;
 use crate::helper::Helper;
 use crate::primary_connector::PrimaryConnector;
@@ -93,7 +94,7 @@ impl Worker {
                 .collect(),
         );
 
-        worker.handle_primary_messages();
+        worker.handle_primary_messages(benchmark_canonical);
         worker.handle_clients_transactions(
             tx_primary.clone(),
             tx_own_local,
@@ -126,8 +127,9 @@ impl Worker {
     }
 
     /// Spawn all tasks responsible to handle messages from our primary.
-    fn handle_primary_messages(&self) {
+    fn handle_primary_messages(&self, benchmark_log_execution: bool) {
         let (tx_synchronizer, rx_synchronizer) = channel(CHANNEL_CAPACITY);
+        let (tx_executor, rx_executor) = channel(CHANNEL_CAPACITY);
 
         // Receive incoming messages from our primary.
         let mut address = self
@@ -139,7 +141,10 @@ impl Worker {
         Receiver::spawn(
             address,
             /* handler */
-            PrimaryReceiverHandler { tx_synchronizer },
+            PrimaryReceiverHandler {
+                tx_synchronizer,
+                tx_executor,
+            },
         );
 
         // The `Synchronizer` is responsible to keep the worker in sync with the others. It handles the commands
@@ -153,6 +158,13 @@ impl Worker {
             self.parameters.sync_retry_delay,
             self.parameters.sync_retry_nodes,
             /* rx_message */ rx_synchronizer,
+        );
+
+        Executor::spawn(
+            self.id,
+            self.store.clone(),
+            /* rx_execute */ rx_executor,
+            benchmark_log_execution,
         );
 
         info!(
@@ -339,6 +351,7 @@ impl MessageHandler for WorkerReceiverHandler {
 #[derive(Clone)]
 struct PrimaryReceiverHandler {
     tx_synchronizer: Sender<PrimaryWorkerMessage>,
+    tx_executor: Sender<Vec<(Digest, WorkerId)>>,
 }
 
 #[async_trait]
@@ -351,6 +364,11 @@ impl MessageHandler for PrimaryReceiverHandler {
         // Deserialize the message and send it to the synchronizer.
         match bincode::deserialize(&serialized) {
             Err(e) => error!("Failed to deserialize primary message: {}", e),
+            Ok(PrimaryWorkerMessage::Execute(digests)) => self
+                .tx_executor
+                .send(digests)
+                .await
+                .expect("Failed to send execute message"),
             Ok(message) => self
                 .tx_synchronizer
                 .send(message)
