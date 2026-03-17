@@ -273,6 +273,12 @@ impl BatchMaker {
         let mut edge_set = HashSet::new();
         let mut missing_edge_set = HashSet::new();
         let mut batch_writers: HashMap<u8, Vec<u64>> = HashMap::new();
+        let mut unresolved_frontiers = HashMap::new();
+        for tx in &standard_txs {
+            unresolved_frontiers
+                .entry(tx.state_key)
+                .or_insert_with(|| self.unresolved_frontier_for_key(tx.state_key));
+        }
         for tx in &standard_txs {
             if let Some(&prev_tx_id) = self.last_writer.get(&tx.state_key) {
                 if prev_tx_id != tx.tx_id {
@@ -280,14 +286,9 @@ impl BatchMaker {
                 }
             }
 
-            if let Some(prior_unprocessed) = self.unprocessed_by_key.get(&tx.state_key) {
-                for &prev_tx_id in prior_unprocessed {
-                    if prev_tx_id != tx.tx_id
-                        && !edge_set.contains(&(prev_tx_id, tx.tx_id))
-                        && self.has_missing_partners(prev_tx_id)
-                    {
-                        missing_edge_set.insert((prev_tx_id, tx.tx_id));
-                    }
+            if let Some(Some(frontier_tx_id)) = unresolved_frontiers.get(&tx.state_key) {
+                if *frontier_tx_id != tx.tx_id && !edge_set.contains(&(*frontier_tx_id, tx.tx_id)) {
+                    missing_edge_set.insert((*frontier_tx_id, tx.tx_id));
                 }
             }
 
@@ -427,6 +428,15 @@ impl BatchMaker {
         self.missing_partners_by_tx
             .get(&tx_id)
             .map_or(false, |partners| !partners.is_empty())
+    }
+
+    fn unresolved_frontier_for_key(&self, state_key: u8) -> Option<u64> {
+        self.unprocessed_by_key.get(&state_key).and_then(|tx_ids| {
+            tx_ids
+                .iter()
+                .copied()
+                .find(|tx_id| self.has_missing_partners(*tx_id))
+        })
     }
 
     fn prune_missing_pairs(&mut self, current_sequence: u64) {

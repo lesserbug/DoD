@@ -360,7 +360,12 @@ impl GlobalOrderer {
         let component_index = Self::component_index(&sccs);
         let missing_edges =
             Self::collect_missing_edges(&nodes, &edges, &component_index, &state_key);
-        let forwarded_missing_edges = Self::collect_forwarded_missing_edges(&local_graphs, &nodes);
+        let forwarded_missing_edges = Self::collect_forwarded_missing_edges(
+            &committee,
+            &local_graphs,
+            &nodes,
+            pending_threshold,
+        );
         Self::linearize_sccs(&mut edges, &sccs);
 
         let reduced_edges = Self::transitive_reduction(&nodes, &edges);
@@ -587,25 +592,32 @@ impl GlobalOrderer {
     }
 
     fn collect_forwarded_missing_edges(
+        committee: &Committee,
         local_graphs: &[Batch],
         nodes: &HashSet<u64>,
+        threshold: Stake,
     ) -> HashSet<(u64, u64)> {
-        let mut missing_edges = HashSet::new();
+        let mut weights: HashMap<(u64, u64), Stake> = HashMap::new();
 
         for graph in local_graphs {
+            let graph_stake = committee.stake(&graph.author);
             let mut seen = HashSet::new();
             for &(from, to) in &graph.missing_edges {
-                if from == to || !(nodes.contains(&from) || nodes.contains(&to)) {
+                let pair = if from <= to { (from, to) } else { (to, from) };
+                if pair.0 == pair.1 || !(nodes.contains(&pair.0) || nodes.contains(&pair.1)) {
                     continue;
                 }
 
-                if seen.insert((from, to)) {
-                    missing_edges.insert((from, to));
+                if seen.insert(pair) {
+                    *weights.entry(pair).or_insert(0) += graph_stake;
                 }
             }
         }
 
-        missing_edges
+        weights
+            .into_iter()
+            .filter_map(|(pair, support)| (support >= threshold).then_some(pair))
+            .collect()
     }
 
     fn linearize_sccs(edges: &mut HashSet<(u64, u64)>, sccs: &[Vec<u64>]) {
