@@ -24,8 +24,15 @@ struct PendingBatch {
     digest: Digest,
     batch: Batch,
     external_dependencies: Vec<u64>,
+    same_batch_pair_count: usize,
     first_seen_sequence: u64,
     stalled_rounds: u32,
+}
+
+#[derive(Default)]
+struct MissingEdgeSummary {
+    external_dependencies: Vec<u64>,
+    same_batch_pair_count: usize,
 }
 
 /// Executes globally ordered batches once the primary feeds back their ordered
@@ -58,6 +65,12 @@ pub struct Executor {
     pending_health_events: u64,
     /// Number of times processed-id eviction was blocked by pending dependencies.
     processed_trim_blocked_events: u64,
+    /// Number of batches released with same-batch ambiguous pairs resolved by
+    /// the deterministic fallback.
+    same_batch_fallback_batches: u64,
+    /// Total count of same-batch ambiguous pairs resolved by the deterministic
+    /// fallback.
+    same_batch_fallback_pairs: u64,
     /// Whether to emit benchmark execution logs.
     benchmark_log_batches: bool,
 }
@@ -92,6 +105,8 @@ impl Executor {
                 dropped_observations: 0,
                 pending_health_events: 0,
                 processed_trim_blocked_events: 0,
+                same_batch_fallback_batches: 0,
+                same_batch_fallback_pairs: 0,
                 benchmark_log_batches,
             }
             .run()
@@ -135,6 +150,7 @@ impl Executor {
                     }
                 };
                 self.latest_sequence = self.latest_sequence.max(batch.sequence);
+                let missing_edge_summary = Self::summarize_missing_edges(&batch);
 
                 if !batch.missing_edges.is_empty() {
                     match self
@@ -154,31 +170,28 @@ impl Executor {
                     }
                 }
 
-                if Self::batch_ready(&batch, &self.processed_tx_ids) {
-                    self.execute_and_feedback(digest, batch).await;
+                if Self::batch_ready(
+                    &missing_edge_summary.external_dependencies,
+                    &self.processed_tx_ids,
+                ) {
+                    self.execute_and_feedback(
+                        digest,
+                        batch,
+                        missing_edge_summary.same_batch_pair_count,
+                    )
+                    .await;
                     self.retry_pending_batches().await;
                 } else {
-                    self.enqueue_pending_batch(digest, batch);
+                    self.enqueue_pending_batch(digest, batch, missing_edge_summary);
                 }
             }
         }
     }
 
-    fn batch_ready(batch: &Batch, processed_tx_ids: &HashSet<u64>) -> bool {
-        let positions: HashSet<_> = batch
-            .transactions
+    fn batch_ready(external_dependencies: &[u64], processed_tx_ids: &HashSet<u64>) -> bool {
+        external_dependencies
             .iter()
-            .filter_map(|tx| parse_transaction_id_and_state_key(tx).map(|(tx_id, _)| tx_id))
-            .collect();
-
-        batch.missing_edges.iter().all(|(left, right)| {
-            match (positions.contains(left), positions.contains(right)) {
-                (true, true) => true,
-                (true, false) => processed_tx_ids.contains(right),
-                (false, true) => processed_tx_ids.contains(left),
-                (false, false) => true,
-            }
-        })
+            .all(|dependency| processed_tx_ids.contains(dependency))
     }
 
     fn execute_batch(batch: &Batch) -> Vec<Transaction> {
@@ -268,7 +281,13 @@ impl Executor {
         ordered
     }
 
-    async fn execute_and_feedback(&mut self, digest: Digest, batch: Batch) {
+    async fn execute_and_feedback(
+        &mut self,
+        digest: Digest,
+        batch: Batch,
+        same_batch_pair_count: usize,
+    ) {
+        self.record_same_batch_fallback(same_batch_pair_count, batch.sequence, &digest);
         let executed_transactions = Self::execute_batch(&batch);
         let processed_tx_ids = Self::collect_processed_tx_ids(&executed_transactions);
         self.remember_processed(&processed_tx_ids);
@@ -302,10 +321,14 @@ impl Executor {
                     .pop_front()
                     .expect("pending batch queue length changed unexpectedly");
 
-                if Self::batch_ready(&pending.batch, &self.processed_tx_ids) {
+                if Self::batch_ready(&pending.external_dependencies, &self.processed_tx_ids) {
                     self.untrack_pending_dependencies(&pending.external_dependencies);
-                    self.execute_and_feedback(pending.digest, pending.batch)
-                        .await;
+                    self.execute_and_feedback(
+                        pending.digest,
+                        pending.batch,
+                        pending.same_batch_pair_count,
+                    )
+                    .await;
                     progressed = true;
                 } else {
                     let mut pending = pending;
@@ -341,38 +364,55 @@ impl Executor {
         tx_ids
     }
 
-    fn enqueue_pending_batch(&mut self, digest: Digest, batch: Batch) {
-        let external_dependencies = Self::external_missing_predecessors(&batch);
-        self.track_pending_dependencies(&external_dependencies);
+    fn enqueue_pending_batch(
+        &mut self,
+        digest: Digest,
+        batch: Batch,
+        missing_edge_summary: MissingEdgeSummary,
+    ) {
+        self.track_pending_dependencies(&missing_edge_summary.external_dependencies);
         self.pending_batches.push_back(PendingBatch {
             digest,
             batch,
-            external_dependencies,
+            external_dependencies: missing_edge_summary.external_dependencies,
+            same_batch_pair_count: missing_edge_summary.same_batch_pair_count,
             first_seen_sequence: self.latest_sequence,
             stalled_rounds: 0,
         });
         self.maybe_log_pending_queue_health();
     }
 
-    fn external_missing_predecessors(batch: &Batch) -> Vec<u64> {
+    fn summarize_missing_edges(batch: &Batch) -> MissingEdgeSummary {
         let positions: HashSet<_> = batch
             .transactions
             .iter()
             .filter_map(|tx| parse_transaction_id_and_state_key(tx).map(|(tx_id, _)| tx_id))
             .collect();
 
-        let mut dependencies = Vec::new();
+        let mut external_dependencies = Vec::new();
+        let mut same_batch_pairs = HashSet::new();
         for &(left, right) in &batch.missing_edges {
             match (positions.contains(&left), positions.contains(&right)) {
-                (true, false) => dependencies.push(right),
-                (false, true) => dependencies.push(left),
+                (true, false) => external_dependencies.push(right),
+                (false, true) => external_dependencies.push(left),
+                (true, true) => {
+                    let pair = if left <= right {
+                        (left, right)
+                    } else {
+                        (right, left)
+                    };
+                    same_batch_pairs.insert(pair);
+                }
                 _ => {}
             }
         }
 
-        dependencies.sort_unstable();
-        dependencies.dedup();
-        dependencies
+        external_dependencies.sort_unstable();
+        external_dependencies.dedup();
+        MissingEdgeSummary {
+            external_dependencies,
+            same_batch_pair_count: same_batch_pairs.len(),
+        }
     }
 
     fn track_pending_dependencies(&mut self, dependencies: &[u64]) {
@@ -475,6 +515,31 @@ impl Executor {
 
     fn should_log_event(&self, count: u64) -> bool {
         count == 1 || count % Self::HEALTH_LOG_INTERVAL == 0
+    }
+
+    fn record_same_batch_fallback(
+        &mut self,
+        same_batch_pair_count: usize,
+        sequence: u64,
+        digest: &Digest,
+    ) {
+        if same_batch_pair_count == 0 {
+            return;
+        }
+
+        self.same_batch_fallback_batches += 1;
+        self.same_batch_fallback_pairs += same_batch_pair_count as u64;
+        if self.should_log_event(self.same_batch_fallback_batches) {
+            warn!(
+                "Executor released {} batches with same-batch fallback ({} pairs total, last_pairs={}, sequence={}, digest={}, pending_queue={})",
+                self.same_batch_fallback_batches,
+                self.same_batch_fallback_pairs,
+                same_batch_pair_count,
+                sequence,
+                digest,
+                self.pending_batches.len(),
+            );
+        }
     }
 
     #[cfg(feature = "benchmark")]

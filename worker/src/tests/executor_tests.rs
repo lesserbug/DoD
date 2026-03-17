@@ -85,12 +85,21 @@ fn queues_batches_with_unprocessed_external_missing_predecessors() {
         edges: Vec::new(),
         missing_edges: vec![(41, 43)],
     };
+    let summary = Executor::summarize_missing_edges(&batch);
 
-    assert!(!Executor::batch_ready(&batch, &HashSet::new()));
+    assert_eq!(summary.external_dependencies, vec![41]);
+    assert_eq!(summary.same_batch_pair_count, 0);
+    assert!(!Executor::batch_ready(
+        &summary.external_dependencies,
+        &HashSet::new()
+    ));
 
     let mut processed = HashSet::new();
     processed.insert(41);
-    assert!(Executor::batch_ready(&batch, &processed));
+    assert!(Executor::batch_ready(
+        &summary.external_dependencies,
+        &processed
+    ));
 }
 
 #[test]
@@ -102,11 +111,29 @@ fn external_missing_predecessors_ignore_same_batch_pairs() {
         edges: Vec::new(),
         missing_edges: vec![(41, 43), (43, 44), (44, 88)],
     };
+    let summary = Executor::summarize_missing_edges(&batch);
 
-    assert_eq!(
-        Executor::external_missing_predecessors(&batch),
-        vec![41, 88]
-    );
+    assert_eq!(summary.external_dependencies, vec![41, 88]);
+    assert_eq!(summary.same_batch_pair_count, 1);
+}
+
+#[test]
+fn same_batch_missing_pairs_do_not_block_batch_readiness() {
+    let batch = Batch {
+        author: PublicKey::default(),
+        sequence: 5,
+        transactions: vec![standard_transaction(43, 9), standard_transaction(44, 9)],
+        edges: Vec::new(),
+        missing_edges: vec![(43, 44)],
+    };
+    let summary = Executor::summarize_missing_edges(&batch);
+
+    assert!(summary.external_dependencies.is_empty());
+    assert_eq!(summary.same_batch_pair_count, 1);
+    assert!(Executor::batch_ready(
+        &summary.external_dependencies,
+        &HashSet::new()
+    ));
 }
 
 #[tokio::test]
@@ -131,6 +158,8 @@ async fn trim_processed_to_cap_keeps_pending_dependencies_pinned() {
         dropped_observations: 0,
         pending_health_events: 0,
         processed_trim_blocked_events: 0,
+        same_batch_fallback_batches: 0,
+        same_batch_fallback_pairs: 0,
         benchmark_log_batches: false,
     };
 
