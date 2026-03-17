@@ -6,6 +6,7 @@ use crate::batch_maker::{
 use crate::worker::WorkerMessage;
 use config::WorkerId;
 use crypto::Digest;
+use log::debug;
 #[cfg(feature = "benchmark")]
 use log::info;
 use log::warn;
@@ -13,7 +14,7 @@ use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 #[cfg(feature = "benchmark")]
 use std::convert::TryInto as _;
 use store::Store;
-use tokio::sync::mpsc::{Receiver, Sender};
+use tokio::sync::mpsc::{error::TrySendError, Receiver, Sender};
 
 #[cfg(test)]
 #[path = "tests/executor_tests.rs"]
@@ -22,6 +23,9 @@ pub mod executor_tests;
 struct PendingBatch {
     digest: Digest,
     batch: Batch,
+    external_dependencies: Vec<u64>,
+    first_seen_sequence: u64,
+    stalled_rounds: u32,
 }
 
 /// Executes globally ordered batches once the primary feeds back their ordered
@@ -44,6 +48,16 @@ pub struct Executor {
     /// Ordered global batches waiting for external missing predecessors to be
     /// marked as processed locally.
     pending_batches: VecDeque<PendingBatch>,
+    /// Reference counts for processed predecessors still needed by queued batches.
+    pending_dependency_counts: HashMap<u64, usize>,
+    /// Latest globally ordered sequence observed by this executor.
+    latest_sequence: u64,
+    /// Number of dropped observe-global-graph control messages.
+    dropped_observations: u64,
+    /// Number of soft-limit queue health events emitted.
+    pending_health_events: u64,
+    /// Number of times processed-id eviction was blocked by pending dependencies.
+    processed_trim_blocked_events: u64,
     /// Whether to emit benchmark execution logs.
     benchmark_log_batches: bool,
 }
@@ -52,6 +66,9 @@ impl Executor {
     /// The maximum number of processed tx ids retained for resolving
     /// carry-over missing predecessors.
     const MAX_PROCESSED_TX_IDS: usize = 65_536;
+    const MAX_PENDING_BATCHES_SOFT: usize = 4_096;
+    const MAX_PENDING_SEQUENCE_LAG_SOFT: u64 = 256;
+    const HEALTH_LOG_INTERVAL: u64 = 64;
 
     pub fn spawn(
         id: WorkerId,
@@ -70,6 +87,11 @@ impl Executor {
                 processed_tx_ids: HashSet::new(),
                 processed_fifo: VecDeque::new(),
                 pending_batches: VecDeque::new(),
+                pending_dependency_counts: HashMap::new(),
+                latest_sequence: 0,
+                dropped_observations: 0,
+                pending_health_events: 0,
+                processed_trim_blocked_events: 0,
                 benchmark_log_batches,
             }
             .run()
@@ -112,19 +134,31 @@ impl Executor {
                         continue;
                     }
                 };
+                self.latest_sequence = self.latest_sequence.max(batch.sequence);
 
                 if !batch.missing_edges.is_empty() {
-                    let _ = self
+                    match self
                         .tx_batch_control
-                        .try_send(BatchMakerControl::observe_global_batch(&batch));
+                        .try_send(BatchMakerControl::observe_global_batch(&batch))
+                    {
+                        Ok(()) => {}
+                        Err(TrySendError::Full(_)) | Err(TrySendError::Closed(_)) => {
+                            self.dropped_observations += 1;
+                            if self.should_log_event(self.dropped_observations) {
+                                warn!(
+                                    "Executor dropped {} global-graph observations while updating local M_w",
+                                    self.dropped_observations
+                                );
+                            }
+                        }
+                    }
                 }
 
                 if Self::batch_ready(&batch, &self.processed_tx_ids) {
                     self.execute_and_feedback(digest, batch).await;
                     self.retry_pending_batches().await;
                 } else {
-                    self.pending_batches
-                        .push_back(PendingBatch { digest, batch });
+                    self.enqueue_pending_batch(digest, batch);
                 }
             }
         }
@@ -269,15 +303,19 @@ impl Executor {
                     .expect("pending batch queue length changed unexpectedly");
 
                 if Self::batch_ready(&pending.batch, &self.processed_tx_ids) {
+                    self.untrack_pending_dependencies(&pending.external_dependencies);
                     self.execute_and_feedback(pending.digest, pending.batch)
                         .await;
                     progressed = true;
                 } else {
+                    let mut pending = pending;
+                    pending.stalled_rounds = pending.stalled_rounds.saturating_add(1);
                     self.pending_batches.push_back(pending);
                 }
             }
 
             if !progressed {
+                self.maybe_log_pending_queue_health();
                 break;
             }
         }
@@ -290,11 +328,7 @@ impl Executor {
             }
         }
 
-        while self.processed_fifo.len() > Self::MAX_PROCESSED_TX_IDS {
-            if let Some(oldest) = self.processed_fifo.pop_front() {
-                self.processed_tx_ids.remove(&oldest);
-            }
-        }
+        self.trim_processed_to_cap(Self::MAX_PROCESSED_TX_IDS);
     }
 
     fn collect_processed_tx_ids(transactions: &[Transaction]) -> Vec<u64> {
@@ -305,6 +339,142 @@ impl Executor {
         tx_ids.sort_unstable();
         tx_ids.dedup();
         tx_ids
+    }
+
+    fn enqueue_pending_batch(&mut self, digest: Digest, batch: Batch) {
+        let external_dependencies = Self::external_missing_predecessors(&batch);
+        self.track_pending_dependencies(&external_dependencies);
+        self.pending_batches.push_back(PendingBatch {
+            digest,
+            batch,
+            external_dependencies,
+            first_seen_sequence: self.latest_sequence,
+            stalled_rounds: 0,
+        });
+        self.maybe_log_pending_queue_health();
+    }
+
+    fn external_missing_predecessors(batch: &Batch) -> Vec<u64> {
+        let positions: HashSet<_> = batch
+            .transactions
+            .iter()
+            .filter_map(|tx| parse_transaction_id_and_state_key(tx).map(|(tx_id, _)| tx_id))
+            .collect();
+
+        let mut dependencies = Vec::new();
+        for &(left, right) in &batch.missing_edges {
+            match (positions.contains(&left), positions.contains(&right)) {
+                (true, false) => dependencies.push(right),
+                (false, true) => dependencies.push(left),
+                _ => {}
+            }
+        }
+
+        dependencies.sort_unstable();
+        dependencies.dedup();
+        dependencies
+    }
+
+    fn track_pending_dependencies(&mut self, dependencies: &[u64]) {
+        for dependency in dependencies {
+            *self
+                .pending_dependency_counts
+                .entry(*dependency)
+                .or_insert(0) += 1;
+        }
+    }
+
+    fn untrack_pending_dependencies(&mut self, dependencies: &[u64]) {
+        for dependency in dependencies {
+            let should_remove = match self.pending_dependency_counts.get_mut(dependency) {
+                Some(count) => {
+                    *count -= 1;
+                    *count == 0
+                }
+                None => false,
+            };
+
+            if should_remove {
+                self.pending_dependency_counts.remove(dependency);
+            }
+        }
+    }
+
+    fn trim_processed_to_cap(&mut self, cap: usize) {
+        let mut scanned = 0usize;
+        while self.processed_fifo.len() > cap && scanned < self.processed_fifo.len() {
+            let Some(oldest) = self.processed_fifo.pop_front() else {
+                break;
+            };
+
+            if self.pending_dependency_counts.contains_key(&oldest) {
+                self.processed_fifo.push_back(oldest);
+                scanned += 1;
+                continue;
+            }
+
+            self.processed_tx_ids.remove(&oldest);
+            scanned = 0;
+        }
+
+        if self.processed_fifo.len() > cap {
+            self.processed_trim_blocked_events += 1;
+            if self.should_log_event(self.processed_trim_blocked_events) {
+                warn!(
+                    "Executor retained {} processed tx ids above cap {} because pending batches still depend on them",
+                    self.processed_fifo.len(),
+                    cap
+                );
+            }
+        }
+    }
+
+    fn maybe_log_pending_queue_health(&mut self) {
+        if self.pending_batches.is_empty() {
+            return;
+        }
+
+        let oldest_sequence = self
+            .pending_batches
+            .iter()
+            .map(|pending| pending.first_seen_sequence)
+            .min()
+            .unwrap_or(self.latest_sequence);
+        let oldest_lag = self.latest_sequence.saturating_sub(oldest_sequence);
+        let max_stalled_rounds = self
+            .pending_batches
+            .iter()
+            .map(|pending| pending.stalled_rounds)
+            .max()
+            .unwrap_or(0);
+
+        let unhealthy = self.pending_batches.len() > Self::MAX_PENDING_BATCHES_SOFT
+            || oldest_lag > Self::MAX_PENDING_SEQUENCE_LAG_SOFT;
+        if !unhealthy {
+            debug!(
+                "Executor pending queue length={}, oldest_lag={}, max_stalled_rounds={}",
+                self.pending_batches.len(),
+                oldest_lag,
+                max_stalled_rounds
+            );
+            return;
+        }
+
+        self.pending_health_events += 1;
+        if self.should_log_event(self.pending_health_events) {
+            warn!(
+                "Executor pending queue length={} oldest_lag={} max_stalled_rounds={} pinned_dependencies={} dropped_observations={}",
+                self.pending_batches.len(),
+                oldest_lag,
+                max_stalled_rounds,
+                self.pending_dependency_counts.len(),
+                self.dropped_observations,
+            );
+        }
+    }
+
+    fn should_log_event(&self, count: u64) -> bool {
+        count == 1 || count % Self::HEALTH_LOG_INTERVAL == 0
     }
 
     #[cfg(feature = "benchmark")]
