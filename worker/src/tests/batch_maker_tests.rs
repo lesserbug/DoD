@@ -1,6 +1,8 @@
 // Copyright(C) Facebook, Inc. and its affiliates.
 use super::*;
 use crate::common::transaction;
+use network::ReliableSender;
+use std::collections::HashMap;
 use tokio::sync::mpsc::channel;
 
 fn standard_transaction(id: u64, state_key: u8) -> Transaction {
@@ -37,6 +39,7 @@ fn parses_legacy_sample_transaction_layout() {
 #[tokio::test]
 async fn make_batch() {
     let (tx_transaction, rx_transaction) = channel(1);
+    let (_tx_control, rx_control) = channel(1);
     let (tx_message, mut rx_message) = channel(1);
     let dummy_addresses = vec![(PublicKey::default(), "127.0.0.1:0".parse().unwrap())];
 
@@ -46,6 +49,7 @@ async fn make_batch() {
         /* max_batch_size */ 200,
         /* max_batch_delay */ 1_000_000, // Ensure the timer is not triggered.
         rx_transaction,
+        rx_control,
         tx_message,
         /* workers_addresses */ dummy_addresses,
     );
@@ -72,6 +76,7 @@ async fn make_batch() {
 #[tokio::test]
 async fn batch_timeout() {
     let (tx_transaction, rx_transaction) = channel(1);
+    let (_tx_control, rx_control) = channel(1);
     let (tx_message, mut rx_message) = channel(1);
     let dummy_addresses = vec![(PublicKey::default(), "127.0.0.1:0".parse().unwrap())];
 
@@ -81,6 +86,7 @@ async fn batch_timeout() {
         /* max_batch_size */ 200,
         /* max_batch_delay */ 50, // Ensure the timer is triggered.
         rx_transaction,
+        rx_control,
         tx_message,
         /* workers_addresses */ dummy_addresses,
     );
@@ -106,6 +112,7 @@ async fn batch_timeout() {
 #[tokio::test]
 async fn local_order_adds_edge_for_conflicting_txs_in_same_batch() {
     let (tx_transaction, rx_transaction) = channel(2);
+    let (_tx_control, rx_control) = channel(1);
     let (tx_message, mut rx_message) = channel(1);
     let dummy_addresses = vec![(PublicKey::default(), "127.0.0.1:0".parse().unwrap())];
 
@@ -114,6 +121,7 @@ async fn local_order_adds_edge_for_conflicting_txs_in_same_batch() {
         /* max_batch_size */ 200,
         /* max_batch_delay */ 1_000_000,
         rx_transaction,
+        rx_control,
         tx_message,
         dummy_addresses,
     );
@@ -140,6 +148,7 @@ async fn local_order_adds_edge_for_conflicting_txs_in_same_batch() {
 #[tokio::test]
 async fn local_order_links_to_all_prior_conflicting_txs() {
     let (tx_transaction, rx_transaction) = channel(3);
+    let (_tx_control, rx_control) = channel(1);
     let (tx_message, mut rx_message) = channel(1);
     let dummy_addresses = vec![(PublicKey::default(), "127.0.0.1:0".parse().unwrap())];
 
@@ -148,6 +157,7 @@ async fn local_order_links_to_all_prior_conflicting_txs() {
         /* max_batch_size */ 300,
         /* max_batch_delay */ 1_000_000,
         rx_transaction,
+        rx_control,
         tx_message,
         dummy_addresses,
     );
@@ -178,6 +188,7 @@ async fn local_order_links_to_all_prior_conflicting_txs() {
 #[tokio::test]
 async fn local_order_keeps_cross_batch_last_writer_without_rebroadcasting_unresolved_txs() {
     let (tx_transaction, rx_transaction) = channel(3);
+    let (_tx_control, rx_control) = channel(1);
     let (tx_message, mut rx_message) = channel(3);
     let dummy_addresses = vec![(PublicKey::default(), "127.0.0.1:0".parse().unwrap())];
 
@@ -186,6 +197,7 @@ async fn local_order_keeps_cross_batch_last_writer_without_rebroadcasting_unreso
         /* max_batch_size */ 100,
         /* max_batch_delay */ 1_000_000,
         rx_transaction,
+        rx_control,
         tx_message,
         dummy_addresses,
     );
@@ -262,5 +274,41 @@ fn observe_global_batch_canonicalizes_missing_edges() {
             assert_eq!(info.tx_ids, vec![42, 43]);
             assert_eq!(info.missing_edges, vec![(42, 43), (100, 101)]);
         }
+        BatchMakerControl::MarkProcessed(_) => panic!("unexpected processed feedback control"),
     }
+}
+
+#[test]
+fn processed_feedback_prunes_unprocessed_state_without_retaining_payloads() {
+    let (_tx_transaction, rx_transaction) = channel(1);
+    let (_tx_control, rx_control) = channel(1);
+    let (tx_message, _rx_message) = channel(1);
+
+    let mut batch_maker = BatchMaker {
+        name: PublicKey::default(),
+        batch_size: 1,
+        max_batch_delay: 1,
+        rx_transaction,
+        rx_control,
+        tx_message,
+        workers_addresses: Vec::new(),
+        current_batch: Vec::new(),
+        current_batch_size: 0,
+        network: ReliableSender::new(),
+        last_writer: HashMap::new(),
+        known_transactions: HashMap::new(),
+        unprocessed_by_key: HashMap::new(),
+        next_sequence: 0,
+    };
+
+    batch_maker.record_unprocessed(41, 9);
+    batch_maker.record_unprocessed(42, 9);
+    batch_maker.record_unprocessed(100, 7);
+    batch_maker.handle_control(BatchMakerControl::mark_processed(vec![42, 999]));
+
+    assert_eq!(batch_maker.known_transactions.get(&41), Some(&9));
+    assert_eq!(batch_maker.known_transactions.get(&42), None);
+    assert_eq!(batch_maker.known_transactions.get(&100), Some(&7));
+    assert_eq!(batch_maker.unprocessed_by_key.get(&9), Some(&vec![41]));
+    assert_eq!(batch_maker.unprocessed_by_key.get(&7), Some(&vec![100]));
 }

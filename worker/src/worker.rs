@@ -1,5 +1,5 @@
 // Copyright(C) Facebook, Inc. and its affiliates.
-use crate::batch_maker::{Batch, BatchMaker, Transaction};
+use crate::batch_maker::{Batch, BatchMaker, BatchMakerControl, Transaction};
 use crate::executor::Executor;
 use crate::global_orderer::GlobalOrderer;
 use crate::helper::Helper;
@@ -79,6 +79,7 @@ impl Worker {
         let (tx_own_local, rx_own_local) = channel(CHANNEL_CAPACITY);
         let (tx_workers_local, rx_workers_local) = channel(CHANNEL_CAPACITY);
         let (tx_global, rx_global) = channel(CHANNEL_CAPACITY);
+        let (tx_batch_control, rx_batch_control) = channel(CHANNEL_CAPACITY);
 
         GlobalOrderer::spawn(
             worker.name,
@@ -94,11 +95,12 @@ impl Worker {
                 .collect(),
         );
 
-        worker.handle_primary_messages(benchmark_canonical);
+        worker.handle_primary_messages(benchmark_canonical, tx_batch_control.clone());
         worker.handle_clients_transactions(
             tx_primary.clone(),
             tx_own_local,
             rx_global,
+            rx_batch_control,
             benchmark_canonical,
         );
         worker.handle_workers_messages(tx_primary, tx_workers_local);
@@ -127,7 +129,11 @@ impl Worker {
     }
 
     /// Spawn all tasks responsible to handle messages from our primary.
-    fn handle_primary_messages(&self, benchmark_log_execution: bool) {
+    fn handle_primary_messages(
+        &self,
+        benchmark_log_execution: bool,
+        tx_batch_control: Sender<BatchMakerControl>,
+    ) {
         let (tx_synchronizer, rx_synchronizer) = channel(CHANNEL_CAPACITY);
         let (tx_executor, rx_executor) = channel(CHANNEL_CAPACITY);
 
@@ -164,6 +170,7 @@ impl Worker {
             self.id,
             self.store.clone(),
             /* rx_execute */ rx_executor,
+            tx_batch_control,
             benchmark_log_execution,
         );
 
@@ -179,6 +186,7 @@ impl Worker {
         tx_primary: Sender<SerializedBatchDigestMessage>,
         tx_own_local: Sender<SerializedBatchMessage>,
         rx_global: tokio::sync::mpsc::Receiver<SerializedBatchMessage>,
+        rx_batch_control: tokio::sync::mpsc::Receiver<BatchMakerControl>,
         benchmark_canonical: bool,
     ) {
         let (tx_batch_maker, rx_batch_maker) = channel(CHANNEL_CAPACITY);
@@ -203,6 +211,7 @@ impl Worker {
             self.parameters.batch_size,
             self.parameters.max_batch_delay,
             /* rx_transaction */ rx_batch_maker,
+            /* rx_control */ rx_batch_control,
             /* tx_message */ tx_quorum_waiter,
             /* workers_addresses */
             self.committee

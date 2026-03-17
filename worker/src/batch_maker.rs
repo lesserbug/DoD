@@ -48,6 +48,7 @@ pub struct GlobalGraphInfo {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum BatchMakerControl {
     ObserveGlobalGraph(GlobalGraphInfo),
+    MarkProcessed(Vec<u64>),
 }
 
 #[allow(dead_code)]
@@ -74,6 +75,12 @@ impl BatchMakerControl {
             tx_ids,
             missing_edges,
         })
+    }
+
+    pub fn mark_processed(mut tx_ids: Vec<u64>) -> Self {
+        tx_ids.sort_unstable();
+        tx_ids.dedup();
+        Self::MarkProcessed(tx_ids)
     }
 }
 
@@ -129,6 +136,8 @@ pub struct BatchMaker {
     max_batch_delay: u64,
     /// Channel to receive transactions from the network.
     rx_transaction: Receiver<Transaction>,
+    /// Channel to receive execution feedback from the worker-side executor.
+    rx_control: Receiver<BatchMakerControl>,
     /// Output channel to deliver sealed batches to the `QuorumWaiter`.
     tx_message: Sender<QuorumWaiterMessage>,
     /// The network addresses of the other workers that share our worker id.
@@ -143,6 +152,13 @@ pub struct BatchMaker {
     /// local graphs. This is the stable cross-batch predecessor evidence used
     /// by the current DoD worker pipeline.
     last_writer: HashMap<u8, u64>,
+    /// Lightweight local `S` skeleton: tx ids we have sealed locally but that
+    /// have not yet been reported as executed back by the worker-side executor.
+    known_transactions: HashMap<u64, u8>,
+    /// Recent unprocessed transactions grouped by state key. We keep only tx ids
+    /// here so the Processed feedback loop does not retain payloads in the hot
+    /// path.
+    unprocessed_by_key: HashMap<u8, Vec<u64>>,
     /// Sequence number of the next local-order graph.
     next_sequence: u64,
 }
@@ -153,6 +169,7 @@ impl BatchMaker {
         batch_size: usize,
         max_batch_delay: u64,
         rx_transaction: Receiver<Transaction>,
+        rx_control: Receiver<BatchMakerControl>,
         tx_message: Sender<QuorumWaiterMessage>,
         workers_addresses: Vec<(PublicKey, SocketAddr)>,
     ) {
@@ -162,12 +179,15 @@ impl BatchMaker {
                 batch_size,
                 max_batch_delay,
                 rx_transaction,
+                rx_control,
                 tx_message,
                 workers_addresses,
                 current_batch: Vec::with_capacity(batch_size * 2),
                 current_batch_size: 0,
                 network: ReliableSender::new(),
                 last_writer: HashMap::new(),
+                known_transactions: HashMap::new(),
+                unprocessed_by_key: HashMap::new(),
                 next_sequence: 0,
             }
             .run()
@@ -192,6 +212,10 @@ impl BatchMaker {
                     }
                 },
 
+                Some(control) = self.rx_control.recv() => {
+                    self.handle_control(control);
+                },
+
                 // If the timer triggers, seal the batch even if it contains few transactions.
                 () = &mut timer => {
                     if !self.current_batch.is_empty() {
@@ -208,6 +232,8 @@ impl BatchMaker {
 
     /// Seal and broadcast the current batch.
     async fn seal(&mut self) {
+        self.drain_control_backlog();
+
         #[cfg(feature = "benchmark")]
         let size = self.current_batch_size;
 
@@ -257,6 +283,10 @@ impl BatchMaker {
             }
         }
 
+        for tx in &standard_txs {
+            self.record_unprocessed(tx.tx_id, tx.state_key);
+        }
+
         let mut edges: Vec<_> = edge_set.into_iter().collect();
         edges.sort_unstable();
 
@@ -302,5 +332,50 @@ impl BatchMaker {
             })
             .await
             .expect("Failed to deliver batch");
+    }
+
+    fn drain_control_backlog(&mut self) {
+        while let Ok(control) = self.rx_control.try_recv() {
+            self.handle_control(control);
+        }
+    }
+
+    fn handle_control(&mut self, control: BatchMakerControl) {
+        match control {
+            BatchMakerControl::ObserveGlobalGraph(_) => {}
+            BatchMakerControl::MarkProcessed(tx_ids) => self.mark_processed(tx_ids),
+        }
+    }
+
+    fn record_unprocessed(&mut self, tx_id: u64, state_key: u8) {
+        if self.known_transactions.insert(tx_id, state_key).is_none() {
+            self.unprocessed_by_key
+                .entry(state_key)
+                .or_default()
+                .push(tx_id);
+        }
+    }
+
+    fn mark_processed(&mut self, tx_ids: Vec<u64>) {
+        let mut touched_keys = HashSet::new();
+
+        for tx_id in tx_ids {
+            if let Some(state_key) = self.known_transactions.remove(&tx_id) {
+                touched_keys.insert(state_key);
+                if let Some(unprocessed) = self.unprocessed_by_key.get_mut(&state_key) {
+                    unprocessed.retain(|candidate| *candidate != tx_id);
+                }
+            }
+        }
+
+        for state_key in touched_keys {
+            let should_remove = self
+                .unprocessed_by_key
+                .get(&state_key)
+                .map_or(false, Vec::is_empty);
+            if should_remove {
+                self.unprocessed_by_key.remove(&state_key);
+            }
+        }
     }
 }

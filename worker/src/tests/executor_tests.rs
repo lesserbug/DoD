@@ -11,6 +11,13 @@ fn standard_transaction(id: u64, state_key: u8) -> Transaction {
     tx
 }
 
+fn legacy_sample_transaction(id: u64) -> Transaction {
+    let mut tx = Vec::with_capacity(9);
+    tx.push(0u8);
+    tx.extend_from_slice(&id.to_be_bytes());
+    tx
+}
+
 #[test]
 fn executes_batches_with_kahn_order() {
     let batch = Batch {
@@ -51,4 +58,16 @@ fn preserves_singleton_batches() {
         .collect();
 
     assert_eq!(tx_ids, vec![11]);
+}
+
+#[test]
+fn processed_feedback_only_tracks_standard_transactions() {
+    let tx_ids = Executor::collect_processed_tx_ids(&[
+        legacy_sample_transaction(1),
+        standard_transaction(3, 9),
+        standard_transaction(2, 9),
+        standard_transaction(3, 9),
+    ]);
+
+    assert_eq!(tx_ids, vec![2, 3]);
 }
