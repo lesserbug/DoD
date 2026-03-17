@@ -1,7 +1,6 @@
 // Copyright(C) Facebook, Inc. and its affiliates.
 use crate::batch_maker::{
-    parse_standard_transaction, parse_transaction_id_and_state_key, Batch, BatchMakerControl,
-    Transaction,
+    parse_standard_transaction, parse_transaction_id_and_state_key, Batch, Transaction,
 };
 use crate::processor::SerializedBatchMessage;
 use crate::worker::WorkerMessage;
@@ -39,8 +38,6 @@ pub struct GlobalOrderer {
     rx_own_local: Receiver<SerializedBatchMessage>,
     /// Receives local-order graphs broadcast by other workers.
     rx_workers_local: Receiver<SerializedBatchMessage>,
-    /// Feeds global-order observations back into the local batch maker.
-    tx_batch_control: Sender<BatchMakerControl>,
     /// Outputs serialized `WorkerMessage::GlobalBatch` graphs.
     tx_global: Sender<SerializedBatchMessage>,
     /// The network addresses of other workers sharing our worker id.
@@ -63,7 +60,6 @@ impl GlobalOrderer {
         committee: Committee,
         rx_own_local: Receiver<SerializedBatchMessage>,
         rx_workers_local: Receiver<SerializedBatchMessage>,
-        tx_batch_control: Sender<BatchMakerControl>,
         tx_global: Sender<SerializedBatchMessage>,
         workers_addresses: Vec<(PublicKey, SocketAddr)>,
     ) {
@@ -73,7 +69,6 @@ impl GlobalOrderer {
                 committee,
                 rx_own_local,
                 rx_workers_local,
-                tx_batch_control,
                 tx_global,
                 workers_addresses,
                 network: ReliableSender::new(),
@@ -248,7 +243,6 @@ impl GlobalOrderer {
         })
         .await
         .expect("Global orderer task panicked while building global-order graph");
-        let control = BatchMakerControl::observe_global_batch(&global_batch);
         let message = WorkerMessage::GlobalBatch(global_batch);
         let serialized = bincode::serialize(&message)
             .expect("Failed to serialize global-order graph as worker message");
@@ -298,11 +292,6 @@ impl GlobalOrderer {
             .send(serialized)
             .await
             .expect("Failed to send global-order graph");
-
-        self.tx_batch_control
-            .send(control)
-            .await
-            .expect("Failed to send global-order observation to batch maker");
 
         true
     }

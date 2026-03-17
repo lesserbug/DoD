@@ -37,7 +37,6 @@ fn parses_legacy_sample_transaction_layout() {
 #[tokio::test]
 async fn make_batch() {
     let (tx_transaction, rx_transaction) = channel(1);
-    let (_tx_control, rx_control) = channel(1);
     let (tx_message, mut rx_message) = channel(1);
     let dummy_addresses = vec![(PublicKey::default(), "127.0.0.1:0".parse().unwrap())];
 
@@ -47,7 +46,6 @@ async fn make_batch() {
         /* max_batch_size */ 200,
         /* max_batch_delay */ 1_000_000, // Ensure the timer is not triggered.
         rx_transaction,
-        rx_control,
         tx_message,
         /* workers_addresses */ dummy_addresses,
     );
@@ -74,7 +72,6 @@ async fn make_batch() {
 #[tokio::test]
 async fn batch_timeout() {
     let (tx_transaction, rx_transaction) = channel(1);
-    let (_tx_control, rx_control) = channel(1);
     let (tx_message, mut rx_message) = channel(1);
     let dummy_addresses = vec![(PublicKey::default(), "127.0.0.1:0".parse().unwrap())];
 
@@ -84,7 +81,6 @@ async fn batch_timeout() {
         /* max_batch_size */ 200,
         /* max_batch_delay */ 50, // Ensure the timer is triggered.
         rx_transaction,
-        rx_control,
         tx_message,
         /* workers_addresses */ dummy_addresses,
     );
@@ -110,7 +106,6 @@ async fn batch_timeout() {
 #[tokio::test]
 async fn local_order_adds_edge_for_conflicting_txs_in_same_batch() {
     let (tx_transaction, rx_transaction) = channel(2);
-    let (_tx_control, rx_control) = channel(1);
     let (tx_message, mut rx_message) = channel(1);
     let dummy_addresses = vec![(PublicKey::default(), "127.0.0.1:0".parse().unwrap())];
 
@@ -119,7 +114,6 @@ async fn local_order_adds_edge_for_conflicting_txs_in_same_batch() {
         /* max_batch_size */ 200,
         /* max_batch_delay */ 1_000_000,
         rx_transaction,
-        rx_control,
         tx_message,
         dummy_addresses,
     );
@@ -146,7 +140,6 @@ async fn local_order_adds_edge_for_conflicting_txs_in_same_batch() {
 #[tokio::test]
 async fn local_order_links_to_all_prior_conflicting_txs() {
     let (tx_transaction, rx_transaction) = channel(3);
-    let (_tx_control, rx_control) = channel(1);
     let (tx_message, mut rx_message) = channel(1);
     let dummy_addresses = vec![(PublicKey::default(), "127.0.0.1:0".parse().unwrap())];
 
@@ -155,7 +148,6 @@ async fn local_order_links_to_all_prior_conflicting_txs() {
         /* max_batch_size */ 300,
         /* max_batch_delay */ 1_000_000,
         rx_transaction,
-        rx_control,
         tx_message,
         dummy_addresses,
     );
@@ -186,7 +178,6 @@ async fn local_order_links_to_all_prior_conflicting_txs() {
 #[tokio::test]
 async fn local_order_keeps_cross_batch_last_writer_without_rebroadcasting_unresolved_txs() {
     let (tx_transaction, rx_transaction) = channel(3);
-    let (tx_control, rx_control) = channel(4);
     let (tx_message, mut rx_message) = channel(3);
     let dummy_addresses = vec![(PublicKey::default(), "127.0.0.1:0".parse().unwrap())];
 
@@ -195,7 +186,6 @@ async fn local_order_keeps_cross_batch_last_writer_without_rebroadcasting_unreso
         /* max_batch_size */ 100,
         /* max_batch_delay */ 1_000_000,
         rx_transaction,
-        rx_control,
         tx_message,
         dummy_addresses,
     );
@@ -234,15 +224,6 @@ async fn local_order_keeps_cross_batch_last_writer_without_rebroadcasting_unreso
         _ => panic!("Unexpected message"),
     }
 
-    tx_control
-        .send(BatchMakerControl::ObserveGlobalGraph(GlobalGraphInfo {
-            sequence: 7,
-            tx_ids: vec![42, 43],
-            missing_edges: vec![(42, 43)],
-        }))
-        .await
-        .unwrap();
-
     tx_transaction
         .send(standard_transaction(44, 9))
         .await
@@ -261,65 +242,25 @@ async fn local_order_keeps_cross_batch_last_writer_without_rebroadcasting_unreso
     }
 }
 
-#[tokio::test]
-async fn global_graph_observations_do_not_override_last_writer_order() {
-    let (tx_transaction, rx_transaction) = channel(3);
-    let (tx_control, rx_control) = channel(4);
-    let (tx_message, mut rx_message) = channel(1);
-    let dummy_addresses = vec![(PublicKey::default(), "127.0.0.1:0".parse().unwrap())];
+#[test]
+fn observe_global_batch_canonicalizes_missing_edges() {
+    let batch = Batch {
+        author: PublicKey::default(),
+        sequence: 7,
+        transactions: vec![
+            standard_transaction(43, 4),
+            legacy_sample_transaction(99),
+            standard_transaction(42, 4),
+        ],
+        edges: Vec::new(),
+        missing_edges: vec![(43, 42), (42, 43), (100, 101)],
+    };
 
-    BatchMaker::spawn(
-        PublicKey::default(),
-        /* max_batch_size */ 100,
-        /* max_batch_delay */ 1_000_000,
-        rx_transaction,
-        rx_control,
-        tx_message,
-        dummy_addresses,
-    );
-
-    tx_transaction
-        .send(standard_transaction(42, 4))
-        .await
-        .unwrap();
-    let _ = rx_message.recv().await.unwrap();
-
-    tx_transaction
-        .send(standard_transaction(43, 4))
-        .await
-        .unwrap();
-    let _ = rx_message.recv().await.unwrap();
-
-    tx_control
-        .send(BatchMakerControl::ObserveGlobalGraph(GlobalGraphInfo {
-            sequence: 0,
-            tx_ids: vec![42, 43],
-            missing_edges: vec![(42, 43)],
-        }))
-        .await
-        .unwrap();
-
-    tx_control
-        .send(BatchMakerControl::ObserveGlobalGraph(GlobalGraphInfo {
-            sequence: 1,
-            tx_ids: vec![42, 43],
-            missing_edges: Vec::new(),
-        }))
-        .await
-        .unwrap();
-
-    tx_transaction
-        .send(standard_transaction(44, 4))
-        .await
-        .unwrap();
-
-    let QuorumWaiterMessage { batch, handlers: _ } = rx_message.recv().await.unwrap();
-    match bincode::deserialize(&batch).unwrap() {
-        WorkerMessage::LocalBatch(batch) => {
-            assert_eq!(batch.sequence, 2);
-            assert_eq!(batch_tx_ids(&batch), vec![44]);
-            assert_eq!(batch.edges, vec![(43, 44)]);
+    match BatchMakerControl::observe_global_batch(&batch) {
+        BatchMakerControl::ObserveGlobalGraph(info) => {
+            assert_eq!(info.sequence, 7);
+            assert_eq!(info.tx_ids, vec![42, 43]);
+            assert_eq!(info.missing_edges, vec![(42, 43), (100, 101)]);
         }
-        _ => panic!("Unexpected message"),
     }
 }

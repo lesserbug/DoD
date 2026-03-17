@@ -1,5 +1,5 @@
 // Copyright(C) Facebook, Inc. and its affiliates.
-use crate::batch_maker::{Batch, BatchMaker, BatchMakerControl, Transaction};
+use crate::batch_maker::{Batch, BatchMaker, Transaction};
 use crate::global_orderer::GlobalOrderer;
 use crate::helper::Helper;
 use crate::primary_connector::PrimaryConnector;
@@ -17,7 +17,7 @@ use primary::PrimaryWorkerMessage;
 use serde::{Deserialize, Serialize};
 use std::error::Error;
 use store::Store;
-use tokio::sync::mpsc::{channel, Receiver as MpscReceiver, Sender};
+use tokio::sync::mpsc::{channel, Sender};
 
 #[cfg(test)]
 #[path = "tests/worker_tests.rs"]
@@ -77,7 +77,6 @@ impl Worker {
         let (tx_primary, rx_primary) = channel(CHANNEL_CAPACITY);
         let (tx_own_local, rx_own_local) = channel(CHANNEL_CAPACITY);
         let (tx_workers_local, rx_workers_local) = channel(CHANNEL_CAPACITY);
-        let (tx_batch_control, rx_batch_control) = channel(CHANNEL_CAPACITY);
         let (tx_global, rx_global) = channel(CHANNEL_CAPACITY);
 
         GlobalOrderer::spawn(
@@ -85,7 +84,6 @@ impl Worker {
             worker.committee.clone(),
             rx_own_local,
             rx_workers_local,
-            tx_batch_control.clone(),
             tx_global,
             worker
                 .committee
@@ -99,11 +97,10 @@ impl Worker {
         worker.handle_clients_transactions(
             tx_primary.clone(),
             tx_own_local,
-            rx_batch_control,
             rx_global,
             benchmark_canonical,
         );
-        worker.handle_workers_messages(tx_primary, tx_workers_local, tx_batch_control);
+        worker.handle_workers_messages(tx_primary, tx_workers_local);
 
         // The `PrimaryConnector` allows the worker to send messages to its primary.
         PrimaryConnector::spawn(
@@ -169,8 +166,7 @@ impl Worker {
         &self,
         tx_primary: Sender<SerializedBatchDigestMessage>,
         tx_own_local: Sender<SerializedBatchMessage>,
-        rx_batch_control: MpscReceiver<BatchMakerControl>,
-        rx_global: MpscReceiver<SerializedBatchMessage>,
+        rx_global: tokio::sync::mpsc::Receiver<SerializedBatchMessage>,
         benchmark_canonical: bool,
     ) {
         let (tx_batch_maker, rx_batch_maker) = channel(CHANNEL_CAPACITY);
@@ -195,7 +191,6 @@ impl Worker {
             self.parameters.batch_size,
             self.parameters.max_batch_delay,
             /* rx_transaction */ rx_batch_maker,
-            /* rx_control */ rx_batch_control,
             /* tx_message */ tx_quorum_waiter,
             /* workers_addresses */
             self.committee
@@ -234,7 +229,6 @@ impl Worker {
         &self,
         tx_primary: Sender<SerializedBatchDigestMessage>,
         tx_workers_local: Sender<SerializedBatchMessage>,
-        tx_batch_control: Sender<BatchMakerControl>,
     ) {
         let (tx_helper, rx_helper) = channel(CHANNEL_CAPACITY);
         let (tx_processor, rx_processor) = channel(CHANNEL_CAPACITY);
@@ -253,7 +247,6 @@ impl Worker {
                 tx_helper,
                 tx_processor,
                 tx_workers_local,
-                tx_batch_control,
             },
         );
 
@@ -309,7 +302,6 @@ struct WorkerReceiverHandler {
     tx_helper: Sender<(Vec<Digest>, PublicKey)>,
     tx_processor: Sender<SerializedBatchMessage>,
     tx_workers_local: Sender<SerializedBatchMessage>,
-    tx_batch_control: Sender<BatchMakerControl>,
 }
 
 #[async_trait]
@@ -326,11 +318,7 @@ impl MessageHandler for WorkerReceiverHandler {
                     .await
                     .expect("Failed to send local graph");
             }
-            Ok(WorkerMessage::GlobalBatch(batch)) => {
-                self.tx_batch_control
-                    .send(BatchMakerControl::observe_global_batch(&batch))
-                    .await
-                    .expect("Failed to send global graph observation");
+            Ok(WorkerMessage::GlobalBatch(..)) => {
                 self.tx_processor
                     .send(serialized.to_vec())
                     .await

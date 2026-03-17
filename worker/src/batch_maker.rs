@@ -10,7 +10,7 @@ use ed25519_dalek::{Digest as _, Sha512};
 #[cfg(feature = "benchmark")]
 use log::info;
 use network::ReliableSender;
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{HashMap, HashSet};
 #[cfg(feature = "benchmark")]
 use std::convert::TryInto as _;
 use std::net::SocketAddr;
@@ -29,13 +29,14 @@ pub struct Batch {
     pub sequence: u64,
     pub transactions: Vec<Transaction>,
     // Local-order dependency edges: (previous_tx_id, current_tx_id).
-    // Each local graph only carries edges among the transactions that are
-    // actually present in that graph.
+    // Within one local graph we keep every earlier conflicting transaction,
+    // while across graphs we only carry the latest known predecessor.
     pub edges: Vec<(u64, u64)>,
     #[serde(default)]
     pub missing_edges: Vec<(u64, u64)>,
 }
 
+#[allow(dead_code)]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct GlobalGraphInfo {
     pub sequence: u64,
@@ -43,11 +44,13 @@ pub struct GlobalGraphInfo {
     pub missing_edges: Vec<(u64, u64)>,
 }
 
+#[allow(dead_code)]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum BatchMakerControl {
     ObserveGlobalGraph(GlobalGraphInfo),
 }
 
+#[allow(dead_code)]
 impl BatchMakerControl {
     pub fn observe_global_batch(batch: &Batch) -> Self {
         let mut tx_ids: Vec<_> = batch
@@ -80,12 +83,7 @@ struct ParsedStandardTx {
     state_key: u8,
 }
 
-#[derive(Clone, Debug)]
-struct KnownTx {
-    first_seen_sequence: u64,
-    last_seen_sequence: u64,
-}
-
+#[allow(dead_code)]
 fn canonical_missing_edge(left: u64, right: u64) -> (u64, u64) {
     if left <= right {
         (left, right)
@@ -131,9 +129,6 @@ pub struct BatchMaker {
     max_batch_delay: u64,
     /// Channel to receive transactions from the network.
     rx_transaction: Receiver<Transaction>,
-    /// Local control channel used to feed global-order observations back into
-    /// the batch maker.
-    rx_control: Receiver<BatchMakerControl>,
     /// Output channel to deliver sealed batches to the `QuorumWaiter`.
     tx_message: Sender<QuorumWaiterMessage>,
     /// The network addresses of the other workers that share our worker id.
@@ -148,31 +143,16 @@ pub struct BatchMaker {
     /// local graphs. This is the stable cross-batch predecessor evidence used
     /// by the current DoD worker pipeline.
     last_writer: HashMap<u8, u64>,
-    /// Standard transactions that this worker has seen recently. This is kept
-    /// as light metadata only; until phase 5 exists, feedback observations
-    /// must stay off the local-order hot path.
-    known_transactions: HashMap<u64, KnownTx>,
-    /// Transactions that remain unresolved according to recent global-order
-    /// observations. This is currently sidecar state only.
-    retained_unresolved: BTreeSet<u64>,
-    /// A bounded local skeleton of `M_w`, currently tracking unresolved pairs
-    /// derived from recent global-order messages.
-    missing_edge_store: HashMap<(u64, u64), u64>,
     /// Sequence number of the next local-order graph.
     next_sequence: u64,
 }
 
 impl BatchMaker {
-    const MAX_KNOWN_TX_HISTORY_SEQUENCES: u64 = 32;
-    const MAX_MISSING_EDGE_HISTORY_SEQUENCES: u64 = 32;
-    const MAX_RETAINED_UNRESOLVED_TXS: usize = 512;
-
     pub fn spawn(
         name: PublicKey,
         batch_size: usize,
         max_batch_delay: u64,
         rx_transaction: Receiver<Transaction>,
-        rx_control: Receiver<BatchMakerControl>,
         tx_message: Sender<QuorumWaiterMessage>,
         workers_addresses: Vec<(PublicKey, SocketAddr)>,
     ) {
@@ -182,16 +162,12 @@ impl BatchMaker {
                 batch_size,
                 max_batch_delay,
                 rx_transaction,
-                rx_control,
                 tx_message,
                 workers_addresses,
                 current_batch: Vec::with_capacity(batch_size * 2),
                 current_batch_size: 0,
                 network: ReliableSender::new(),
                 last_writer: HashMap::new(),
-                known_transactions: HashMap::new(),
-                retained_unresolved: BTreeSet::new(),
-                missing_edge_store: HashMap::new(),
                 next_sequence: 0,
             }
             .run()
@@ -208,19 +184,12 @@ impl BatchMaker {
             tokio::select! {
                 // Assemble client transactions into batches of preset size.
                 Some(transaction) = self.rx_transaction.recv() => {
-                    if let Some((tx_id, _)) = parse_standard_transaction(&transaction) {
-                        self.record_known_transaction(self.next_sequence, tx_id);
-                    }
                     self.current_batch_size += transaction.len();
                     self.current_batch.push(transaction);
                     if self.current_batch_size >= self.batch_size {
                         self.seal().await;
                         timer.as_mut().reset(Instant::now() + Duration::from_millis(self.max_batch_delay));
                     }
-                },
-
-                Some(control) = self.rx_control.recv() => {
-                    self.handle_control(control);
                 },
 
                 // If the timer triggers, seal the batch even if it contains few transactions.
@@ -250,15 +219,9 @@ impl BatchMaker {
             .filter_map(|tx| tx[1..9].try_into().ok())
             .collect();
 
-        while let Ok(control) = self.rx_control.try_recv() {
-            self.handle_control(control);
-        }
-
-        let sequence = self.next_sequence;
-        self.prune_local_state(sequence);
-
         self.current_batch_size = 0;
         let transactions: Vec<_> = self.current_batch.drain(..).collect();
+        let sequence = self.next_sequence;
 
         let standard_txs: Vec<_> = transactions
             .iter()
@@ -339,89 +302,5 @@ impl BatchMaker {
             })
             .await
             .expect("Failed to deliver batch");
-    }
-
-    fn handle_control(&mut self, control: BatchMakerControl) {
-        match control {
-            BatchMakerControl::ObserveGlobalGraph(info) => {
-                let observed_txs: HashSet<_> = info.tx_ids.iter().copied().collect();
-                let observed_pairs: HashSet<_> = info
-                    .missing_edges
-                    .iter()
-                    .map(|&(left, right)| canonical_missing_edge(left, right))
-                    .collect();
-
-                self.missing_edge_store.retain(|&(left, right), _| {
-                    if observed_txs.contains(&left) && observed_txs.contains(&right) {
-                        observed_pairs.contains(&(left, right))
-                    } else {
-                        true
-                    }
-                });
-                for pair in observed_pairs {
-                    self.missing_edge_store.insert(pair, info.sequence);
-                }
-
-                self.refresh_retained_unresolved();
-            }
-        }
-
-        self.prune_local_state(self.next_sequence);
-    }
-
-    fn refresh_retained_unresolved(&mut self) {
-        self.retained_unresolved = self
-            .missing_edge_store
-            .keys()
-            .flat_map(|(left, right)| [*left, *right])
-            .filter(|tx_id| self.known_transactions.contains_key(tx_id))
-            .collect();
-    }
-
-    fn record_known_transaction(&mut self, sequence: u64, tx_id: u64) {
-        self.known_transactions
-            .entry(tx_id)
-            .and_modify(|known| {
-                known.last_seen_sequence = sequence;
-            })
-            .or_insert(KnownTx {
-                first_seen_sequence: sequence,
-                last_seen_sequence: sequence,
-            });
-    }
-
-    fn prune_local_state(&mut self, current_sequence: u64) {
-        let min_known_sequence =
-            current_sequence.saturating_sub(Self::MAX_KNOWN_TX_HISTORY_SEQUENCES.saturating_sub(1));
-        let retained_unresolved = self.retained_unresolved.clone();
-        self.known_transactions.retain(|tx_id, known| {
-            retained_unresolved.contains(tx_id) || known.last_seen_sequence >= min_known_sequence
-        });
-
-        let known_tx_ids: HashSet<_> = self.known_transactions.keys().copied().collect();
-        self.retained_unresolved
-            .retain(|tx_id| known_tx_ids.contains(tx_id));
-
-        if self.retained_unresolved.len() > Self::MAX_RETAINED_UNRESOLVED_TXS {
-            let mut ordered: Vec<_> = self.retained_unresolved.iter().copied().collect();
-            ordered.sort_unstable_by_key(|tx_id| {
-                self.known_transactions
-                    .get(tx_id)
-                    .map(|known| (known.first_seen_sequence, *tx_id))
-                    .unwrap_or((u64::MAX, *tx_id))
-            });
-            self.retained_unresolved = ordered
-                .into_iter()
-                .take(Self::MAX_RETAINED_UNRESOLVED_TXS)
-                .collect();
-        }
-
-        let min_missing_sequence = current_sequence
-            .saturating_sub(Self::MAX_MISSING_EDGE_HISTORY_SEQUENCES.saturating_sub(1));
-        self.missing_edge_store.retain(|(left, right), sequence| {
-            *sequence >= min_missing_sequence
-                && known_tx_ids.contains(left)
-                && known_tx_ids.contains(right)
-        });
     }
 }
