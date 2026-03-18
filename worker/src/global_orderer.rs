@@ -356,14 +356,8 @@ impl GlobalOrderer {
         let mut edges =
             Self::build_weighted_edges(&nodes, &state_key, &edge_weights, pending_threshold);
         Self::retain_sccs_with_path_to_fixed(&mut nodes, &mut edges, &fixed_txs, &pending_txs);
-        let forwarded_in_batch_edges =
-            Self::collect_forwarded_in_batch_edges(&committee, &local_graphs, &nodes, pending_threshold);
-        for (from, to) in forwarded_in_batch_edges {
-            if !edges.contains(&(to, from)) {
-                edges.insert((from, to));
-            }
-        }
-
+        let forwarded_in_batch_support =
+            Self::collect_forwarded_in_batch_support(&committee, &local_graphs, &nodes);
         let sccs = Self::tarjan_scc(&nodes, &edges);
         let component_index = Self::component_index(&sccs);
         let forwarded_missing_edges = Self::collect_forwarded_external_missing_edges(
@@ -376,10 +370,20 @@ impl GlobalOrderer {
 
         let reduced_edges = Self::transitive_reduction(&nodes, &edges);
         let ordered_tx_ids = Self::topological_sort(&nodes, &reduced_edges);
-        let missing_edges = Self::collect_missing_edges(
+        let promoted_in_batch_edges = Self::collect_frontier_promoted_in_batch_edges(
             &ordered_tx_ids,
             &nodes,
             &reduced_edges,
+            &state_key,
+            &forwarded_in_batch_support,
+            pending_threshold,
+        );
+        let mut final_edge_set = reduced_edges.clone();
+        final_edge_set.extend(promoted_in_batch_edges);
+        let missing_edges = Self::collect_missing_edges(
+            &ordered_tx_ids,
+            &nodes,
+            &final_edge_set,
             &component_index,
             &state_key,
         );
@@ -389,7 +393,7 @@ impl GlobalOrderer {
             .filter_map(|tx_id| canonical_tx.get(&tx_id).cloned())
             .collect();
 
-        let mut final_edges: Vec<_> = reduced_edges
+        let mut final_edges: Vec<_> = final_edge_set
             .into_iter()
             .filter(|(from, to)| nodes.contains(from) && nodes.contains(to) && from != to)
             .collect();
@@ -614,12 +618,11 @@ impl GlobalOrderer {
         missing_edges
     }
 
-    fn collect_forwarded_in_batch_edges(
+    fn collect_forwarded_in_batch_support(
         committee: &Committee,
         local_graphs: &[Batch],
         nodes: &HashSet<u64>,
-        threshold: Stake,
-    ) -> HashSet<(u64, u64)> {
+    ) -> HashMap<(u64, u64), Stake> {
         let mut weights: HashMap<(u64, u64), Stake> = HashMap::new();
 
         for graph in local_graphs {
@@ -637,12 +640,50 @@ impl GlobalOrderer {
         }
 
         weights
-            .iter()
-            .filter_map(|(&(from, to), &support)| {
-                let reverse_support = weights.get(&(to, from)).copied().unwrap_or(0);
-                (support >= threshold && support > reverse_support).then_some((from, to))
-            })
-            .collect()
+    }
+
+    fn collect_frontier_promoted_in_batch_edges(
+        ordered_tx_ids: &[u64],
+        nodes: &HashSet<u64>,
+        edges: &HashSet<(u64, u64)>,
+        state_key: &HashMap<u64, u8>,
+        support: &HashMap<(u64, u64), Stake>,
+        threshold: Stake,
+    ) -> HashSet<(u64, u64)> {
+        let mut adjacency = Self::build_adjacency(nodes, edges);
+        let mut txs_by_key: HashMap<u8, Vec<u64>> = HashMap::new();
+        for &tx_id in ordered_tx_ids {
+            if nodes.contains(&tx_id) {
+                if let Some(&key) = state_key.get(&tx_id) {
+                    txs_by_key.entry(key).or_default().push(tx_id);
+                }
+            }
+        }
+
+        let mut promoted = HashSet::new();
+        for tx_ids in txs_by_key.values() {
+            for (index, &current) in tx_ids.iter().enumerate() {
+                for &candidate in tx_ids[..index].iter().rev() {
+                    let forward_support = support.get(&(candidate, current)).copied().unwrap_or(0);
+                    if forward_support < threshold {
+                        continue;
+                    }
+
+                    let reverse_support = support.get(&(current, candidate)).copied().unwrap_or(0);
+                    if forward_support <= reverse_support
+                        || Self::has_path_in_adjacency(candidate, current, &adjacency)
+                    {
+                        continue;
+                    }
+
+                    promoted.insert((candidate, current));
+                    adjacency.entry(candidate).or_default().insert(current);
+                    break;
+                }
+            }
+        }
+
+        promoted
     }
 
     fn collect_forwarded_external_missing_edges(
