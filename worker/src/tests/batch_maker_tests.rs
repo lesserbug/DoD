@@ -501,6 +501,7 @@ fn drops_duplicate_unprocessed_standard_transactions() {
         missing_partners_by_tx: HashMap::new(),
         missing_pairs: HashSet::new(),
         missing_pair_fifo: VecDeque::new(),
+        pending_controls: VecDeque::new(),
         next_sequence: 0,
     };
 
@@ -544,6 +545,7 @@ fn drops_reappearing_transactions_while_they_are_still_unprocessed() {
         missing_partners_by_tx: HashMap::new(),
         missing_pairs: HashSet::new(),
         missing_pair_fifo: VecDeque::new(),
+        pending_controls: VecDeque::new(),
         next_sequence: 0,
     };
 
@@ -580,6 +582,7 @@ fn processed_feedback_marks_processed_state_for_control_path() {
         missing_partners_by_tx: HashMap::new(),
         missing_pairs: HashSet::new(),
         missing_pair_fifo: VecDeque::new(),
+        pending_controls: VecDeque::new(),
         next_sequence: 0,
     };
 
@@ -623,6 +626,7 @@ fn processed_feedback_prunes_unprocessed_state_without_retaining_payloads() {
         missing_partners_by_tx: HashMap::new(),
         missing_pairs: HashSet::new(),
         missing_pair_fifo: VecDeque::new(),
+        pending_controls: VecDeque::new(),
         next_sequence: 0,
     };
 
@@ -636,4 +640,51 @@ fn processed_feedback_prunes_unprocessed_state_without_retaining_payloads() {
     assert_eq!(batch_maker.known_transactions.get(&100), Some(&7));
     assert_eq!(batch_maker.unprocessed_by_key.get(&9), Some(&vec![41]));
     assert_eq!(batch_maker.unprocessed_by_key.get(&7), Some(&vec![100]));
+}
+
+#[test]
+fn drain_control_backlog_limits_work_not_whole_messages() {
+    let (_tx_transaction, rx_transaction) = channel(1);
+    let (_tx_control, rx_control) = channel(1);
+    let (tx_message, _rx_message) = channel(1);
+
+    let mut batch_maker = BatchMaker {
+        name: PublicKey::default(),
+        batch_size: 1,
+        max_batch_delay: 1,
+        rx_transaction,
+        rx_control,
+        tx_message,
+        workers_addresses: Vec::new(),
+        current_batch: Vec::new(),
+        current_batch_standard_ids: HashSet::new(),
+        current_batch_size: 0,
+        network: ReliableSender::new(),
+        last_writer: HashMap::new(),
+        known_transactions: HashMap::new(),
+        unprocessed_by_key: HashMap::new(),
+        processed_tx_ids: HashSet::new(),
+        processed_tx_fifo: VecDeque::new(),
+        missing_partners_by_tx: HashMap::new(),
+        missing_pairs: HashSet::new(),
+        missing_pair_fifo: VecDeque::new(),
+        pending_controls: VecDeque::new(),
+        next_sequence: 0,
+    };
+
+    batch_maker.record_unprocessed(41, 9);
+    batch_maker.record_unprocessed(42, 9);
+    batch_maker.enqueue_control(BatchMakerControl::mark_processed(vec![41, 42]));
+
+    batch_maker.drain_control_backlog(1);
+
+    assert!(batch_maker.processed_tx_ids.contains(&41));
+    assert!(!batch_maker.processed_tx_ids.contains(&42));
+    assert_eq!(batch_maker.known_transactions.get(&41), None);
+    assert_eq!(batch_maker.known_transactions.get(&42), Some(&9));
+    assert_eq!(batch_maker.pending_controls.len(), 1);
+
+    batch_maker.drain_control_backlog(1);
+    assert!(batch_maker.processed_tx_ids.contains(&42));
+    assert!(batch_maker.pending_controls.is_empty());
 }

@@ -101,6 +101,17 @@ enum TxState {
     Unseen,
 }
 
+#[derive(Debug)]
+enum PendingControl {
+    ObserveGlobalGraph {
+        sequence: u64,
+        missing_edges: VecDeque<(u64, u64)>,
+    },
+    MarkProcessed {
+        tx_ids: VecDeque<u64>,
+    },
+}
+
 #[allow(dead_code)]
 fn canonical_missing_edge(left: u64, right: u64) -> (u64, u64) {
     if left <= right {
@@ -181,14 +192,16 @@ pub struct BatchMaker {
     missing_partners_by_tx: HashMap<u64, Vec<u64>>,
     missing_pairs: HashSet<(u64, u64)>,
     missing_pair_fifo: VecDeque<(u64, (u64, u64))>,
+    pending_controls: VecDeque<PendingControl>,
     /// Sequence number of the next local-order graph.
     next_sequence: u64,
 }
 
 impl BatchMaker {
-    const INGRESS_CONTROL_BUDGET: usize = 1;
-    const IDLE_CONTROL_BUDGET: usize = 64;
-    const SEAL_CONTROL_BUDGET: usize = 64;
+    const INGRESS_CONTROL_WORK_BUDGET: usize = 1;
+    const IDLE_CONTROL_WORK_BUDGET: usize = 4_096;
+    const PRE_SEAL_CONTROL_WORK_BUDGET: usize = 8;
+    const SEAL_CONTROL_WORK_BUDGET: usize = 0;
     const MAX_PROCESSED_TX_IDS: usize = 65_536;
     const MAX_MISSING_PAIRS: usize = 4_096;
     const MAX_MISSING_PAIR_AGE: u64 = 128;
@@ -223,6 +236,7 @@ impl BatchMaker {
                 missing_partners_by_tx: HashMap::new(),
                 missing_pairs: HashSet::new(),
                 missing_pair_fifo: VecDeque::new(),
+                pending_controls: VecDeque::new(),
                 next_sequence: 0,
             }
             .run()
@@ -242,10 +256,11 @@ impl BatchMaker {
                     let budget = if self.accept_transaction(transaction)
                         && self.current_batch_size >= self.batch_size
                     {
+                        self.drain_control_backlog(Self::PRE_SEAL_CONTROL_WORK_BUDGET);
                         self.seal().await;
                         0
                     } else {
-                        Self::INGRESS_CONTROL_BUDGET
+                        Self::INGRESS_CONTROL_WORK_BUDGET
                     };
 
                     timer.as_mut().reset(Instant::now() + Duration::from_millis(self.max_batch_delay));
@@ -255,10 +270,11 @@ impl BatchMaker {
                 // If the timer triggers, seal the batch even if it contains few transactions.
                 () = &mut timer => {
                     let budget = if !self.current_batch.is_empty() {
+                        self.drain_control_backlog(Self::PRE_SEAL_CONTROL_WORK_BUDGET);
                         self.seal().await;
                         0
                     } else {
-                        Self::IDLE_CONTROL_BUDGET
+                        Self::IDLE_CONTROL_WORK_BUDGET
                     };
 
                     timer.as_mut().reset(Instant::now() + Duration::from_millis(self.max_batch_delay));
@@ -277,7 +293,7 @@ impl BatchMaker {
 
     /// Seal and broadcast the current batch.
     async fn seal(&mut self) {
-        self.drain_control_backlog(Self::SEAL_CONTROL_BUDGET);
+        self.drain_control_backlog(Self::SEAL_CONTROL_WORK_BUDGET);
 
         #[cfg(feature = "benchmark")]
         let size = self.current_batch_size;
@@ -395,12 +411,28 @@ impl BatchMaker {
             .expect("Failed to deliver batch");
     }
 
-    fn drain_control_backlog(&mut self, budget: usize) {
-        for _ in 0..budget {
-            let Ok(control) = self.rx_control.try_recv() else {
+    fn drain_control_backlog(&mut self, work_budget: usize) {
+        let mut remaining_work = work_budget;
+        while remaining_work > 0 {
+            if self.pending_controls.is_empty() {
+                let Ok(control) = self.rx_control.try_recv() else {
+                    break;
+                };
+                self.enqueue_control(control);
+                continue;
+            }
+
+            let Some(mut pending) = self.pending_controls.pop_front() else {
                 break;
             };
-            self.handle_control(control);
+            let spent = self.process_pending_control(&mut pending, remaining_work);
+            if !Self::pending_control_complete(&pending) {
+                self.pending_controls.push_front(pending);
+            }
+            if spent == 0 {
+                break;
+            }
+            remaining_work = remaining_work.saturating_sub(spent);
         }
     }
 
@@ -432,6 +464,72 @@ impl BatchMaker {
         }
     }
 
+    fn enqueue_control(&mut self, control: BatchMakerControl) {
+        match control {
+            BatchMakerControl::ObserveGlobalGraph(info) => {
+                self.prune_missing_pairs(info.sequence);
+                if !info.missing_edges.is_empty() {
+                    self.pending_controls
+                        .push_back(PendingControl::ObserveGlobalGraph {
+                            sequence: info.sequence,
+                            missing_edges: info.missing_edges.into(),
+                        });
+                }
+            }
+            BatchMakerControl::MarkProcessed(tx_ids) => {
+                if !tx_ids.is_empty() {
+                    self.pending_controls
+                        .push_back(PendingControl::MarkProcessed {
+                            tx_ids: tx_ids.into(),
+                        });
+                }
+            }
+        }
+    }
+
+    fn process_pending_control(
+        &mut self,
+        pending: &mut PendingControl,
+        work_budget: usize,
+    ) -> usize {
+        match pending {
+            PendingControl::ObserveGlobalGraph {
+                sequence,
+                missing_edges,
+            } => {
+                let mut spent = 0;
+                while spent < work_budget {
+                    let Some(pair) = missing_edges.pop_front() else {
+                        break;
+                    };
+                    self.handle_observed_missing_pair(*sequence, pair);
+                    spent += 1;
+                }
+                spent
+            }
+            PendingControl::MarkProcessed { tx_ids } => {
+                let mut spent = 0;
+                let mut touched_keys = HashSet::new();
+                while spent < work_budget {
+                    let Some(tx_id) = tx_ids.pop_front() else {
+                        break;
+                    };
+                    self.mark_processed_one(tx_id, &mut touched_keys);
+                    spent += 1;
+                }
+                self.prune_empty_unprocessed_keys(touched_keys);
+                spent
+            }
+        }
+    }
+
+    fn pending_control_complete(pending: &PendingControl) -> bool {
+        match pending {
+            PendingControl::ObserveGlobalGraph { missing_edges, .. } => missing_edges.is_empty(),
+            PendingControl::MarkProcessed { tx_ids } => tx_ids.is_empty(),
+        }
+    }
+
     fn record_unprocessed(&mut self, tx_id: u64, state_key: u8) {
         if self.known_transactions.insert(tx_id, state_key).is_none() {
             self.unprocessed_by_key
@@ -457,19 +555,23 @@ impl BatchMaker {
         self.prune_missing_pairs(info.sequence);
 
         for pair in info.missing_edges {
-            let (left, right) = pair;
-            let left_state = self.tx_state(left);
-            let right_state = self.tx_state(right);
-            if left_state == TxState::Processed || right_state == TxState::Processed {
-                continue;
-            }
-
-            if left_state != TxState::Unprocessed && right_state != TxState::Unprocessed {
-                continue;
-            }
-
-            self.insert_missing_pair(info.sequence, (left, right));
+            self.handle_observed_missing_pair(info.sequence, pair);
         }
+    }
+
+    fn handle_observed_missing_pair(&mut self, sequence: u64, pair: (u64, u64)) {
+        let (left, right) = pair;
+        let left_state = self.tx_state(left);
+        let right_state = self.tx_state(right);
+        if left_state == TxState::Processed || right_state == TxState::Processed {
+            return;
+        }
+
+        if left_state != TxState::Unprocessed && right_state != TxState::Unprocessed {
+            return;
+        }
+
+        self.insert_missing_pair(sequence, (left, right));
     }
 
     fn insert_missing_pair(&mut self, sequence: u64, pair: (u64, u64)) {
@@ -552,16 +654,24 @@ impl BatchMaker {
         let mut touched_keys = HashSet::new();
 
         for tx_id in tx_ids {
-            self.remember_processed(tx_id);
-            if let Some(state_key) = self.known_transactions.remove(&tx_id) {
-                touched_keys.insert(state_key);
-                if let Some(unprocessed) = self.unprocessed_by_key.get_mut(&state_key) {
-                    unprocessed.retain(|candidate| *candidate != tx_id);
-                }
-            }
-            self.remove_all_missing_pairs_for(tx_id);
+            self.mark_processed_one(tx_id, &mut touched_keys);
         }
 
+        self.prune_empty_unprocessed_keys(touched_keys);
+    }
+
+    fn mark_processed_one(&mut self, tx_id: u64, touched_keys: &mut HashSet<u8>) {
+        self.remember_processed(tx_id);
+        if let Some(state_key) = self.known_transactions.remove(&tx_id) {
+            touched_keys.insert(state_key);
+            if let Some(unprocessed) = self.unprocessed_by_key.get_mut(&state_key) {
+                unprocessed.retain(|candidate| *candidate != tx_id);
+            }
+        }
+        self.remove_all_missing_pairs_for(tx_id);
+    }
+
+    fn prune_empty_unprocessed_keys(&mut self, touched_keys: HashSet<u8>) {
         for state_key in touched_keys {
             let should_remove = self
                 .unprocessed_by_key
