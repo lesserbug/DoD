@@ -78,15 +78,17 @@ impl Worker {
         let (tx_primary, rx_primary) = channel(CHANNEL_CAPACITY);
         let (tx_own_local, rx_own_local) = channel(CHANNEL_CAPACITY);
         let (tx_workers_local, rx_workers_local) = channel(CHANNEL_CAPACITY);
+        let (tx_workers_global, rx_workers_global) = channel(CHANNEL_CAPACITY);
         let (tx_global, rx_global) = channel(CHANNEL_CAPACITY);
         let (tx_batch_observation, rx_batch_observation) = channel(CHANNEL_CAPACITY);
         let (tx_batch_processed, rx_batch_processed) = channel(CHANNEL_CAPACITY);
 
-        GlobalOrderer::spawn(
+        GlobalOrderer::spawn_with_global_sync_channel(
             worker.name,
             worker.committee.clone(),
             rx_own_local,
             rx_workers_local,
+            rx_workers_global,
             tx_global,
             worker
                 .committee
@@ -109,7 +111,7 @@ impl Worker {
             rx_batch_processed,
             benchmark_canonical,
         );
-        worker.handle_workers_messages(tx_primary, tx_workers_local);
+        worker.handle_workers_messages(tx_primary, tx_workers_local, tx_workers_global);
 
         // The `PrimaryConnector` allows the worker to send messages to its primary.
         PrimaryConnector::spawn(
@@ -260,6 +262,7 @@ impl Worker {
         &self,
         tx_primary: Sender<SerializedBatchDigestMessage>,
         tx_workers_local: Sender<SerializedBatchMessage>,
+        tx_workers_global: Sender<SerializedBatchMessage>,
     ) {
         let (tx_helper, rx_helper) = channel(CHANNEL_CAPACITY);
         let (tx_processor, rx_processor) = channel(CHANNEL_CAPACITY);
@@ -278,6 +281,7 @@ impl Worker {
                 tx_helper,
                 tx_processor,
                 tx_workers_local,
+                tx_workers_global,
             },
         );
 
@@ -333,6 +337,7 @@ struct WorkerReceiverHandler {
     tx_helper: Sender<(Vec<Digest>, PublicKey)>,
     tx_processor: Sender<SerializedBatchMessage>,
     tx_workers_local: Sender<SerializedBatchMessage>,
+    tx_workers_global: Sender<SerializedBatchMessage>,
 }
 
 #[async_trait]
@@ -354,6 +359,10 @@ impl MessageHandler for WorkerReceiverHandler {
                     .send(serialized.to_vec())
                     .await
                     .expect("Failed to send global graph");
+                self.tx_workers_global
+                    .send(serialized.to_vec())
+                    .await
+                    .expect("Failed to send global graph to global orderer");
             }
             Ok(WorkerMessage::BatchRequest(missing, requestor)) => self
                 .tx_helper

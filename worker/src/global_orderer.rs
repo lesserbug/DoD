@@ -11,7 +11,7 @@ use futures::stream::futures_unordered::FuturesUnordered;
 use futures::stream::StreamExt as _;
 use log::{debug, warn};
 use network::ReliableSender;
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::net::SocketAddr;
 use tokio::sync::mpsc::{Receiver, Sender};
 use tokio::time::{Duration, Instant};
@@ -38,6 +38,8 @@ pub struct GlobalOrderer {
     rx_own_local: Receiver<SerializedBatchMessage>,
     /// Receives local-order graphs broadcast by other workers.
     rx_workers_local: Receiver<SerializedBatchMessage>,
+    /// Receives global-order graphs for cross-round missing-edge accumulation.
+    rx_workers_global: Receiver<SerializedBatchMessage>,
     /// Outputs serialized `WorkerMessage::GlobalBatch` graphs.
     tx_global: Sender<SerializedBatchMessage>,
     /// The network addresses of other workers sharing our worker id.
@@ -48,18 +50,52 @@ pub struct GlobalOrderer {
     sequences: HashMap<u64, SequenceState>,
     /// Finalized sequences are ignored if duplicated later.
     finalized: HashSet<u64>,
+    /// Recently observed global-order batches, deduplicated by (author, sequence).
+    observed_global_batches: HashSet<(PublicKey, u64)>,
+    observed_global_batches_fifo: VecDeque<(u64, (PublicKey, u64))>,
+    /// Sliding-window directional support accumulated from past global missing
+    /// edges. This approximates DoD's cross-round missing-edge store M_w
+    /// without forcing BatchMaker or the executor hot path to change again.
+    accumulated_missing_support: HashMap<(u64, u64), Stake>,
+    accumulated_missing_support_fifo: VecDeque<(u64, (u64, u64))>,
 }
 
 impl GlobalOrderer {
     const STABILIZATION_DELAY_MS: u64 = 10;
     const ORDER_FAIRNESS_GAMMA_NUM: Stake = 1;
     const ORDER_FAIRNESS_GAMMA_DEN: Stake = 1;
+    const MAX_OBSERVED_GLOBAL_BATCHES: usize = 8_192;
+    const MAX_OBSERVED_GLOBAL_BATCH_AGE: u64 = 256;
+    const MAX_ACCUMULATED_MISSING_OBSERVATIONS: usize = 32_768;
+    const MAX_ACCUMULATED_MISSING_AGE: u64 = 256;
 
+    #[allow(dead_code)]
     pub fn spawn(
         name: PublicKey,
         committee: Committee,
         rx_own_local: Receiver<SerializedBatchMessage>,
         rx_workers_local: Receiver<SerializedBatchMessage>,
+        tx_global: Sender<SerializedBatchMessage>,
+        workers_addresses: Vec<(PublicKey, SocketAddr)>,
+    ) {
+        let (_tx_workers_global, rx_workers_global) = tokio::sync::mpsc::channel(1);
+        Self::spawn_with_global_sync_channel(
+            name,
+            committee,
+            rx_own_local,
+            rx_workers_local,
+            rx_workers_global,
+            tx_global,
+            workers_addresses,
+        );
+    }
+
+    pub fn spawn_with_global_sync_channel(
+        name: PublicKey,
+        committee: Committee,
+        rx_own_local: Receiver<SerializedBatchMessage>,
+        rx_workers_local: Receiver<SerializedBatchMessage>,
+        rx_workers_global: Receiver<SerializedBatchMessage>,
         tx_global: Sender<SerializedBatchMessage>,
         workers_addresses: Vec<(PublicKey, SocketAddr)>,
     ) {
@@ -69,11 +105,16 @@ impl GlobalOrderer {
                 committee,
                 rx_own_local,
                 rx_workers_local,
+                rx_workers_global,
                 tx_global,
                 workers_addresses,
                 network: ReliableSender::new(),
                 sequences: HashMap::new(),
                 finalized: HashSet::new(),
+                observed_global_batches: HashSet::new(),
+                observed_global_batches_fifo: VecDeque::new(),
+                accumulated_missing_support: HashMap::new(),
+                accumulated_missing_support_fifo: VecDeque::new(),
             }
             .run()
             .await;
@@ -91,6 +132,9 @@ impl GlobalOrderer {
                 }
                 Some(serialized) = self.rx_workers_local.recv() => {
                     self.handle_local_graph(serialized, false).await;
+                }
+                Some(serialized) = self.rx_workers_global.recv() => {
+                    self.handle_global_graph_sync(serialized);
                 }
                 _ = stabilization_tick.tick() => {}
                 else => {
@@ -187,6 +231,28 @@ impl GlobalOrderer {
         }
     }
 
+    fn handle_global_graph_sync(&mut self, serialized: SerializedBatchMessage) {
+        let batch = match bincode::deserialize(&serialized) {
+            Ok(WorkerMessage::GlobalBatch(batch)) => batch,
+            Ok(other) => {
+                warn!(
+                    "GlobalOrderer received unexpected synchronized worker message: {:?}",
+                    other
+                );
+                return;
+            }
+            Err(error) => {
+                warn!(
+                    "GlobalOrderer failed to deserialize synchronized global graph: {}",
+                    error
+                );
+                return;
+            }
+        };
+
+        self.observe_global_batch(&batch);
+    }
+
     fn ready_sequences(&self, now: Instant) -> Vec<u64> {
         let delay = Duration::from_millis(Self::STABILIZATION_DELAY_MS);
         let quorum = self.committee.quorum_threshold();
@@ -238,11 +304,19 @@ impl GlobalOrderer {
     async fn finalize_sequence(&mut self, sequence: u64, graphs: Vec<Batch>) -> bool {
         let name = self.name;
         let committee = self.committee.clone();
+        let accumulated_missing_support = self.accumulated_missing_support.clone();
         let global_batch = tokio::task::spawn_blocking(move || {
-            Self::build_global_batch(name, committee, sequence, graphs)
+            Self::build_global_batch(
+                name,
+                committee,
+                sequence,
+                graphs,
+                accumulated_missing_support,
+            )
         })
         .await
         .expect("Global orderer task panicked while building global-order graph");
+        self.observe_global_batch(&global_batch);
         let message = WorkerMessage::GlobalBatch(global_batch);
         let serialized = bincode::serialize(&message)
             .expect("Failed to serialize global-order graph as worker message");
@@ -296,11 +370,86 @@ impl GlobalOrderer {
         true
     }
 
+    fn observe_global_batch(&mut self, batch: &Batch) {
+        if self.committee.stake(&batch.author) == 0 {
+            return;
+        }
+
+        let batch_id = (batch.author, batch.sequence);
+        if !self.observed_global_batches.insert(batch_id) {
+            return;
+        }
+        self.observed_global_batches_fifo
+            .push_back((batch.sequence, batch_id));
+        self.prune_observed_global_batches(batch.sequence);
+
+        for &(from, to) in &batch.missing_edges {
+            if from == to {
+                continue;
+            }
+
+            *self
+                .accumulated_missing_support
+                .entry((from, to))
+                .or_insert(0) += 1;
+            self.accumulated_missing_support_fifo
+                .push_back((batch.sequence, (from, to)));
+        }
+        self.prune_accumulated_missing_support(batch.sequence);
+    }
+
+    fn prune_observed_global_batches(&mut self, current_sequence: u64) {
+        loop {
+            let Some(&(sequence, batch_id)) = self.observed_global_batches_fifo.front() else {
+                break;
+            };
+
+            let too_many = self.observed_global_batches.len() > Self::MAX_OBSERVED_GLOBAL_BATCHES;
+            let too_old =
+                current_sequence.saturating_sub(sequence) > Self::MAX_OBSERVED_GLOBAL_BATCH_AGE;
+            if !too_many && !too_old {
+                break;
+            }
+
+            self.observed_global_batches_fifo.pop_front();
+            self.observed_global_batches.remove(&batch_id);
+        }
+    }
+
+    fn prune_accumulated_missing_support(&mut self, current_sequence: u64) {
+        loop {
+            let Some(&(sequence, pair)) = self.accumulated_missing_support_fifo.front() else {
+                break;
+            };
+
+            let too_many = self.accumulated_missing_support_fifo.len()
+                > Self::MAX_ACCUMULATED_MISSING_OBSERVATIONS;
+            let too_old =
+                current_sequence.saturating_sub(sequence) > Self::MAX_ACCUMULATED_MISSING_AGE;
+            if !too_many && !too_old {
+                break;
+            }
+
+            self.accumulated_missing_support_fifo.pop_front();
+            let should_remove = match self.accumulated_missing_support.get_mut(&pair) {
+                Some(weight) => {
+                    *weight = weight.saturating_sub(1);
+                    *weight == 0
+                }
+                None => false,
+            };
+            if should_remove {
+                self.accumulated_missing_support.remove(&pair);
+            }
+        }
+    }
+
     fn build_global_batch(
         name: PublicKey,
         committee: Committee,
         sequence: u64,
         local_graphs: Vec<Batch>,
+        accumulated_missing_support: HashMap<(u64, u64), Stake>,
     ) -> Batch {
         let fixed_threshold = Self::fixed_threshold(&committee);
         let pending_threshold = Self::pending_threshold(&committee);
@@ -353,8 +502,13 @@ impl GlobalOrderer {
             .collect();
 
         let edge_weights = Self::collect_edge_weights(&committee, &local_graphs, &nodes);
-        let mut edges =
-            Self::build_weighted_edges(&nodes, &state_key, &edge_weights, pending_threshold);
+        let mut edges = Self::build_weighted_edges(
+            &nodes,
+            &state_key,
+            &edge_weights,
+            &accumulated_missing_support,
+            pending_threshold,
+        );
         Self::retain_sccs_with_path_to_fixed(&mut nodes, &mut edges, &fixed_txs, &pending_txs);
         let forwarded_in_batch_support =
             Self::collect_forwarded_in_batch_support(&committee, &local_graphs, &nodes);
@@ -364,6 +518,7 @@ impl GlobalOrderer {
             &committee,
             &local_graphs,
             &nodes,
+            &accumulated_missing_support,
             pending_threshold,
         );
         Self::linearize_sccs(&mut edges, &sccs);
@@ -377,6 +532,7 @@ impl GlobalOrderer {
             &state_key,
             &edge_weights,
             &forwarded_in_batch_support,
+            &accumulated_missing_support,
             pending_threshold,
         );
         let mut final_edge_set = reduced_edges.clone();
@@ -471,6 +627,7 @@ impl GlobalOrderer {
         nodes: &HashSet<u64>,
         state_key: &HashMap<u64, u8>,
         edge_weights: &HashMap<(u64, u64), Stake>,
+        accumulated_missing_support: &HashMap<(u64, u64), Stake>,
         threshold: Stake,
     ) -> HashSet<(u64, u64)> {
         let mut txs_by_key: HashMap<u8, Vec<u64>> = HashMap::new();
@@ -488,8 +645,26 @@ impl GlobalOrderer {
         for tx_ids in txs_by_key.values() {
             for (index, &left) in tx_ids.iter().enumerate() {
                 for &right in tx_ids.iter().skip(index + 1) {
-                    let forward = edge_weights.get(&(left, right)).copied().unwrap_or(0);
-                    let backward = edge_weights.get(&(right, left)).copied().unwrap_or(0);
+                    let forward = edge_weights
+                        .get(&(left, right))
+                        .copied()
+                        .unwrap_or(0)
+                        .saturating_add(
+                            accumulated_missing_support
+                                .get(&(left, right))
+                                .copied()
+                                .unwrap_or(0),
+                        );
+                    let backward = edge_weights
+                        .get(&(right, left))
+                        .copied()
+                        .unwrap_or(0)
+                        .saturating_add(
+                            accumulated_missing_support
+                                .get(&(right, left))
+                                .copied()
+                                .unwrap_or(0),
+                        );
 
                     if forward >= threshold && forward > backward {
                         edges.insert((left, right));
@@ -650,6 +825,7 @@ impl GlobalOrderer {
         state_key: &HashMap<u64, u8>,
         edge_weights: &HashMap<(u64, u64), Stake>,
         missing_support: &HashMap<(u64, u64), Stake>,
+        accumulated_missing_support: &HashMap<(u64, u64), Stake>,
         threshold: Stake,
     ) -> HashSet<(u64, u64)> {
         let mut adjacency = Self::build_adjacency(nodes, edges);
@@ -679,6 +855,12 @@ impl GlobalOrderer {
                                 .copied()
                                 .unwrap_or(0),
                         );
+                    let forward_support = forward_support.saturating_add(
+                        accumulated_missing_support
+                            .get(&(candidate, current))
+                            .copied()
+                            .unwrap_or(0),
+                    );
                     if forward_support < threshold {
                         continue;
                     }
@@ -693,6 +875,12 @@ impl GlobalOrderer {
                                 .copied()
                                 .unwrap_or(0),
                         );
+                    let reverse_support = reverse_support.saturating_add(
+                        accumulated_missing_support
+                            .get(&(current, candidate))
+                            .copied()
+                            .unwrap_or(0),
+                    );
                     if forward_support <= reverse_support
                         || Self::has_path_in_adjacency(candidate, current, &adjacency)
                     {
@@ -713,6 +901,7 @@ impl GlobalOrderer {
         committee: &Committee,
         local_graphs: &[Batch],
         nodes: &HashSet<u64>,
+        accumulated_missing_support: &HashMap<(u64, u64), Stake>,
         threshold: Stake,
     ) -> HashSet<(u64, u64)> {
         let mut weights: HashMap<(u64, u64), Stake> = HashMap::new();
@@ -736,7 +925,11 @@ impl GlobalOrderer {
 
         weights
             .into_iter()
-            .filter_map(|(pair, support)| (support >= threshold).then_some(pair))
+            .filter_map(|(pair, support)| {
+                let total_support = support
+                    .saturating_add(accumulated_missing_support.get(&pair).copied().unwrap_or(0));
+                (total_support >= threshold).then_some(pair)
+            })
             .collect()
     }
 
