@@ -182,14 +182,14 @@ pub struct BatchMaker {
     /// Recent unprocessed transactions grouped by state key. We keep only tx ids
     /// here so the Processed feedback loop does not retain payloads in the hot
     /// path.
-    unprocessed_by_key: HashMap<u8, Vec<u64>>,
+    unprocessed_by_key: HashMap<u8, VecDeque<u64>>,
     /// Recent processed transaction ids retained long enough to preserve the
     /// local Processed/Unseen distinction without growing state unboundedly.
     processed_tx_ids: HashSet<u64>,
     processed_tx_fifo: VecDeque<u64>,
     /// Lightweight `M_w`: recent unresolved pairs touching locally known
     /// transactions, indexed by local tx id and bounded by age/size.
-    missing_partners_by_tx: HashMap<u64, Vec<u64>>,
+    missing_partners_by_tx: HashMap<u64, HashSet<u64>>,
     missing_pairs: HashSet<(u64, u64)>,
     missing_pair_fifo: VecDeque<(u64, (u64, u64))>,
     pending_controls: VecDeque<PendingControl>,
@@ -324,9 +324,10 @@ impl BatchMaker {
         let mut batch_writers: HashMap<u8, Vec<u64>> = HashMap::new();
         let mut unresolved_frontiers = HashMap::new();
         for tx in &standard_txs {
-            unresolved_frontiers
-                .entry(tx.state_key)
-                .or_insert_with(|| self.unresolved_frontier_for_key(tx.state_key));
+            if !unresolved_frontiers.contains_key(&tx.state_key) {
+                let frontier = self.unresolved_frontier_for_key(tx.state_key);
+                unresolved_frontiers.insert(tx.state_key, frontier);
+            }
         }
         for tx in &standard_txs {
             if let Some(&prev_tx_id) = self.last_writer.get(&tx.state_key) {
@@ -535,7 +536,7 @@ impl BatchMaker {
             self.unprocessed_by_key
                 .entry(state_key)
                 .or_default()
-                .push(tx_id);
+                .push_back(tx_id);
         }
     }
 
@@ -591,9 +592,7 @@ impl BatchMaker {
         }
 
         let partners = self.missing_partners_by_tx.entry(tx_id).or_default();
-        if !partners.contains(&partner) {
-            partners.push(partner);
-        }
+        partners.insert(partner);
     }
 
     fn has_missing_partners(&self, tx_id: u64) -> bool {
@@ -602,10 +601,11 @@ impl BatchMaker {
             .map_or(false, |partners| !partners.is_empty())
     }
 
-    fn unresolved_frontier_for_key(&self, state_key: u8) -> Option<u64> {
+    fn unresolved_frontier_for_key(&mut self, state_key: u8) -> Option<u64> {
+        self.prune_unprocessed_prefix(state_key);
         self.unprocessed_by_key.get(&state_key).and_then(|tx_ids| {
             tx_ids.iter().copied().find(|tx_id| {
-                self.tx_state(*tx_id) == TxState::Unprocessed && self.has_missing_partners(*tx_id)
+                self.known_transactions.contains_key(tx_id) && self.has_missing_partners(*tx_id)
             })
         })
     }
@@ -639,7 +639,7 @@ impl BatchMaker {
     fn remove_missing_partner(&mut self, tx_id: u64, partner: u64) {
         let should_remove = match self.missing_partners_by_tx.get_mut(&tx_id) {
             Some(partners) => {
-                partners.retain(|candidate| *candidate != partner);
+                partners.remove(&partner);
                 partners.is_empty()
             }
             None => false,
@@ -664,22 +664,40 @@ impl BatchMaker {
         self.remember_processed(tx_id);
         if let Some(state_key) = self.known_transactions.remove(&tx_id) {
             touched_keys.insert(state_key);
-            if let Some(unprocessed) = self.unprocessed_by_key.get_mut(&state_key) {
-                unprocessed.retain(|candidate| *candidate != tx_id);
-            }
         }
         self.remove_all_missing_pairs_for(tx_id);
     }
 
     fn prune_empty_unprocessed_keys(&mut self, touched_keys: HashSet<u8>) {
         for state_key in touched_keys {
+            self.prune_unprocessed_prefix(state_key);
             let should_remove = self
                 .unprocessed_by_key
                 .get(&state_key)
-                .map_or(false, Vec::is_empty);
+                .map_or(false, VecDeque::is_empty);
             if should_remove {
                 self.unprocessed_by_key.remove(&state_key);
             }
+        }
+    }
+
+    fn prune_unprocessed_prefix(&mut self, state_key: u8) {
+        let known_transactions = &self.known_transactions;
+        let should_remove = match self.unprocessed_by_key.get_mut(&state_key) {
+            Some(unprocessed) => {
+                while let Some(&tx_id) = unprocessed.front() {
+                    if known_transactions.contains_key(&tx_id) {
+                        break;
+                    }
+                    unprocessed.pop_front();
+                }
+                unprocessed.is_empty()
+            }
+            None => false,
+        };
+
+        if should_remove {
+            self.unprocessed_by_key.remove(&state_key);
         }
     }
 
@@ -698,7 +716,7 @@ impl BatchMaker {
     }
 
     fn remove_all_missing_pairs_for(&mut self, tx_id: u64) {
-        let Some(partners) = self.missing_partners_by_tx.get(&tx_id).cloned() else {
+        let Some(partners) = self.missing_partners_by_tx.remove(&tx_id) else {
             return;
         };
 
@@ -706,7 +724,5 @@ impl BatchMaker {
             let pair = canonical_missing_edge(tx_id, partner);
             self.remove_missing_pair(pair);
         }
-
-        self.missing_partners_by_tx.remove(&tx_id);
     }
 }

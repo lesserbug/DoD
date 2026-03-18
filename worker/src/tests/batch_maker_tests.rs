@@ -29,6 +29,13 @@ fn batch_tx_ids(batch: &Batch) -> Vec<u64> {
         .collect()
 }
 
+fn queued_unprocessed_ids(batch_maker: &BatchMaker, state_key: u8) -> Option<Vec<u64>> {
+    batch_maker
+        .unprocessed_by_key
+        .get(&state_key)
+        .map(|tx_ids| tx_ids.iter().copied().collect())
+}
+
 #[test]
 fn parses_legacy_sample_transaction_layout() {
     let tx = legacy_sample_transaction(42);
@@ -638,8 +645,8 @@ fn processed_feedback_prunes_unprocessed_state_without_retaining_payloads() {
     assert_eq!(batch_maker.known_transactions.get(&41), Some(&9));
     assert_eq!(batch_maker.known_transactions.get(&42), None);
     assert_eq!(batch_maker.known_transactions.get(&100), Some(&7));
-    assert_eq!(batch_maker.unprocessed_by_key.get(&9), Some(&vec![41]));
-    assert_eq!(batch_maker.unprocessed_by_key.get(&7), Some(&vec![100]));
+    assert_eq!(queued_unprocessed_ids(&batch_maker, 9), Some(vec![41, 42]));
+    assert_eq!(queued_unprocessed_ids(&batch_maker, 7), Some(vec![100]));
 }
 
 #[test]
