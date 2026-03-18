@@ -183,6 +183,10 @@ pub struct BatchMaker {
     /// here so the Processed feedback loop does not retain payloads in the hot
     /// path.
     unprocessed_by_key: HashMap<u8, VecDeque<u64>>,
+    /// Count of processed tx ids still lingering inside each per-key queue. We
+    /// use this to trigger occasional local compaction without making every
+    /// `MarkProcessed` update scan or rewrite the whole queue.
+    stale_unprocessed_by_key: HashMap<u8, usize>,
     /// Recent processed transaction ids retained long enough to preserve the
     /// local Processed/Unseen distinction without growing state unboundedly.
     processed_tx_ids: HashSet<u64>,
@@ -205,6 +209,7 @@ impl BatchMaker {
     const MAX_PROCESSED_TX_IDS: usize = 65_536;
     const MAX_MISSING_PAIRS: usize = 4_096;
     const MAX_MISSING_PAIR_AGE: u64 = 128;
+    const MIN_STALE_UNPROCESSED_BEFORE_COMPACT: usize = 32;
 
     pub fn spawn(
         name: PublicKey,
@@ -231,6 +236,7 @@ impl BatchMaker {
                 last_writer: HashMap::new(),
                 known_transactions: HashMap::new(),
                 unprocessed_by_key: HashMap::new(),
+                stale_unprocessed_by_key: HashMap::new(),
                 processed_tx_ids: HashSet::new(),
                 processed_tx_fifo: VecDeque::new(),
                 missing_partners_by_tx: HashMap::new(),
@@ -603,6 +609,7 @@ impl BatchMaker {
 
     fn unresolved_frontier_for_key(&mut self, state_key: u8) -> Option<u64> {
         self.prune_unprocessed_prefix(state_key);
+        self.maybe_compact_unprocessed_key(state_key);
         self.unprocessed_by_key.get(&state_key).and_then(|tx_ids| {
             tx_ids.iter().copied().find(|tx_id| {
                 self.known_transactions.contains_key(tx_id) && self.has_missing_partners(*tx_id)
@@ -664,6 +671,7 @@ impl BatchMaker {
         self.remember_processed(tx_id);
         if let Some(state_key) = self.known_transactions.remove(&tx_id) {
             touched_keys.insert(state_key);
+            *self.stale_unprocessed_by_key.entry(state_key).or_insert(0) += 1;
         }
         self.remove_all_missing_pairs_for(tx_id);
     }
@@ -683,6 +691,7 @@ impl BatchMaker {
 
     fn prune_unprocessed_prefix(&mut self, state_key: u8) {
         let known_transactions = &self.known_transactions;
+        let mut removed = 0usize;
         let should_remove = match self.unprocessed_by_key.get_mut(&state_key) {
             Some(unprocessed) => {
                 while let Some(&tx_id) = unprocessed.front() {
@@ -690,7 +699,52 @@ impl BatchMaker {
                         break;
                     }
                     unprocessed.pop_front();
+                    removed += 1;
                 }
+                unprocessed.is_empty()
+            }
+            None => false,
+        };
+
+        if removed > 0 {
+            self.reduce_stale_unprocessed_count(state_key, removed);
+        }
+
+        if should_remove {
+            self.unprocessed_by_key.remove(&state_key);
+            self.stale_unprocessed_by_key.remove(&state_key);
+        }
+    }
+
+    fn maybe_compact_unprocessed_key(&mut self, state_key: u8) {
+        let stale = self
+            .stale_unprocessed_by_key
+            .get(&state_key)
+            .copied()
+            .unwrap_or(0);
+        if stale < Self::MIN_STALE_UNPROCESSED_BEFORE_COMPACT {
+            return;
+        }
+
+        let len = self
+            .unprocessed_by_key
+            .get(&state_key)
+            .map_or(0, VecDeque::len);
+        if len == 0 || stale.saturating_mul(2) < len {
+            return;
+        }
+
+        let known_transactions = &self.known_transactions;
+        let should_remove = match self.unprocessed_by_key.get_mut(&state_key) {
+            Some(unprocessed) => {
+                let mut compacted =
+                    VecDeque::with_capacity(unprocessed.len().saturating_sub(stale));
+                while let Some(tx_id) = unprocessed.pop_front() {
+                    if known_transactions.contains_key(&tx_id) {
+                        compacted.push_back(tx_id);
+                    }
+                }
+                *unprocessed = compacted;
                 unprocessed.is_empty()
             }
             None => false,
@@ -698,6 +752,20 @@ impl BatchMaker {
 
         if should_remove {
             self.unprocessed_by_key.remove(&state_key);
+            self.stale_unprocessed_by_key.remove(&state_key);
+        } else {
+            self.stale_unprocessed_by_key.insert(state_key, 0);
+        }
+    }
+
+    fn reduce_stale_unprocessed_count(&mut self, state_key: u8, removed: usize) {
+        let Some(stale) = self.stale_unprocessed_by_key.get_mut(&state_key) else {
+            return;
+        };
+
+        *stale = stale.saturating_sub(removed);
+        if *stale == 0 {
+            self.stale_unprocessed_by_key.remove(&state_key);
         }
     }
 

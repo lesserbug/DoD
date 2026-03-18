@@ -503,6 +503,7 @@ fn drops_duplicate_unprocessed_standard_transactions() {
         last_writer: HashMap::new(),
         known_transactions: HashMap::new(),
         unprocessed_by_key: HashMap::new(),
+        stale_unprocessed_by_key: HashMap::new(),
         processed_tx_ids: HashSet::new(),
         processed_tx_fifo: VecDeque::new(),
         missing_partners_by_tx: HashMap::new(),
@@ -547,6 +548,7 @@ fn drops_reappearing_transactions_while_they_are_still_unprocessed() {
         last_writer: HashMap::new(),
         known_transactions: HashMap::new(),
         unprocessed_by_key: HashMap::new(),
+        stale_unprocessed_by_key: HashMap::new(),
         processed_tx_ids: HashSet::new(),
         processed_tx_fifo: VecDeque::new(),
         missing_partners_by_tx: HashMap::new(),
@@ -584,6 +586,7 @@ fn processed_feedback_marks_processed_state_for_control_path() {
         last_writer: HashMap::new(),
         known_transactions: HashMap::new(),
         unprocessed_by_key: HashMap::new(),
+        stale_unprocessed_by_key: HashMap::new(),
         processed_tx_ids: HashSet::new(),
         processed_tx_fifo: VecDeque::new(),
         missing_partners_by_tx: HashMap::new(),
@@ -628,6 +631,7 @@ fn processed_feedback_prunes_unprocessed_state_without_retaining_payloads() {
         last_writer: HashMap::new(),
         known_transactions: HashMap::new(),
         unprocessed_by_key: HashMap::new(),
+        stale_unprocessed_by_key: HashMap::new(),
         processed_tx_ids: HashSet::new(),
         processed_tx_fifo: VecDeque::new(),
         missing_partners_by_tx: HashMap::new(),
@@ -670,6 +674,7 @@ fn drain_control_backlog_limits_work_not_whole_messages() {
         last_writer: HashMap::new(),
         known_transactions: HashMap::new(),
         unprocessed_by_key: HashMap::new(),
+        stale_unprocessed_by_key: HashMap::new(),
         processed_tx_ids: HashSet::new(),
         processed_tx_fifo: VecDeque::new(),
         missing_partners_by_tx: HashMap::new(),
@@ -694,4 +699,53 @@ fn drain_control_backlog_limits_work_not_whole_messages() {
     batch_maker.drain_control_backlog(1);
     assert!(batch_maker.processed_tx_ids.contains(&42));
     assert!(batch_maker.pending_controls.is_empty());
+}
+
+#[test]
+fn unresolved_frontier_compacts_dirty_key_queues() {
+    let (_tx_transaction, rx_transaction) = channel(1);
+    let (_tx_control, rx_control) = channel(1);
+    let (tx_message, _rx_message) = channel(1);
+
+    let mut batch_maker = BatchMaker {
+        name: PublicKey::default(),
+        batch_size: 1,
+        max_batch_delay: 1,
+        rx_transaction,
+        rx_control,
+        tx_message,
+        workers_addresses: Vec::new(),
+        current_batch: Vec::new(),
+        current_batch_standard_ids: HashSet::new(),
+        current_batch_size: 0,
+        network: ReliableSender::new(),
+        last_writer: HashMap::new(),
+        known_transactions: HashMap::new(),
+        unprocessed_by_key: HashMap::new(),
+        stale_unprocessed_by_key: HashMap::new(),
+        processed_tx_ids: HashSet::new(),
+        processed_tx_fifo: VecDeque::new(),
+        missing_partners_by_tx: HashMap::new(),
+        missing_pairs: HashSet::new(),
+        missing_pair_fifo: VecDeque::new(),
+        pending_controls: VecDeque::new(),
+        next_sequence: 0,
+    };
+
+    for tx_id in 1..=64 {
+        batch_maker.record_unprocessed(tx_id, 9);
+    }
+    batch_maker.handle_control(BatchMakerControl::mark_processed((33..=64).collect()));
+    batch_maker.observe_global_graph(GlobalGraphInfo {
+        sequence: 0,
+        tx_ids: vec![1, 500],
+        missing_edges: vec![(1, 500)],
+    });
+
+    assert_eq!(batch_maker.unresolved_frontier_for_key(9), Some(1));
+    assert_eq!(
+        queued_unprocessed_ids(&batch_maker, 9),
+        Some((1..=32).collect())
+    );
+    assert_eq!(batch_maker.stale_unprocessed_by_key.get(&9), Some(&0));
 }
