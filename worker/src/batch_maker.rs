@@ -186,7 +186,9 @@ pub struct BatchMaker {
 }
 
 impl BatchMaker {
-    const MAX_CONTROL_MESSAGES_PER_TICK: usize = 64;
+    const INGRESS_CONTROL_BUDGET: usize = 1;
+    const IDLE_CONTROL_BUDGET: usize = 64;
+    const SEAL_CONTROL_BUDGET: usize = 64;
     const MAX_PROCESSED_TX_IDS: usize = 65_536;
     const MAX_MISSING_PAIRS: usize = 4_096;
     const MAX_MISSING_PAIR_AGE: u64 = 128;
@@ -234,27 +236,39 @@ impl BatchMaker {
         tokio::pin!(timer);
 
         loop {
-            tokio::select! {
+            let control_budget = tokio::select! {
                 // Assemble client transactions into batches of preset size.
                 Some(transaction) = self.rx_transaction.recv() => {
-                    if self.accept_transaction(transaction)
+                    let budget = if self.accept_transaction(transaction)
                         && self.current_batch_size >= self.batch_size
                     {
                         self.seal().await;
-                        timer.as_mut().reset(Instant::now() + Duration::from_millis(self.max_batch_delay));
-                    }
+                        0
+                    } else {
+                        Self::INGRESS_CONTROL_BUDGET
+                    };
+
+                    timer.as_mut().reset(Instant::now() + Duration::from_millis(self.max_batch_delay));
+                    budget
                 },
 
                 // If the timer triggers, seal the batch even if it contains few transactions.
                 () = &mut timer => {
-                    if !self.current_batch.is_empty() {
+                    let budget = if !self.current_batch.is_empty() {
                         self.seal().await;
-                    }
-                    timer.as_mut().reset(Instant::now() + Duration::from_millis(self.max_batch_delay));
-                }
-            }
+                        0
+                    } else {
+                        Self::IDLE_CONTROL_BUDGET
+                    };
 
-            self.drain_control_backlog(Self::MAX_CONTROL_MESSAGES_PER_TICK);
+                    timer.as_mut().reset(Instant::now() + Duration::from_millis(self.max_batch_delay));
+                    budget
+                }
+            };
+
+            if control_budget > 0 {
+                self.drain_control_backlog(control_budget);
+            }
 
             // Give the chance to schedule other tasks.
             tokio::task::yield_now().await;
@@ -263,7 +277,7 @@ impl BatchMaker {
 
     /// Seal and broadcast the current batch.
     async fn seal(&mut self) {
-        self.drain_control_backlog(Self::MAX_CONTROL_MESSAGES_PER_TICK);
+        self.drain_control_backlog(Self::SEAL_CONTROL_BUDGET);
 
         #[cfg(feature = "benchmark")]
         let size = self.current_batch_size;
