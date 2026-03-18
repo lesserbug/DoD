@@ -93,6 +93,14 @@ struct ParsedStandardTx {
     state_key: u8,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TxState {
+    Processed,
+    Unprocessed,
+    InBatch,
+    Unseen,
+}
+
 #[allow(dead_code)]
 fn canonical_missing_edge(left: u64, right: u64) -> (u64, u64) {
     if left <= right {
@@ -384,10 +392,7 @@ impl BatchMaker {
 
     fn accept_transaction(&mut self, transaction: Transaction) -> bool {
         if let Some((tx_id, _)) = parse_standard_transaction(&transaction) {
-            if self.processed_tx_ids.contains(&tx_id)
-                || self.known_transactions.contains_key(&tx_id)
-                || self.current_batch_standard_ids.contains(&tx_id)
-            {
+            if self.tx_state(tx_id) != TxState::Unseen {
                 return false;
             }
 
@@ -415,18 +420,30 @@ impl BatchMaker {
         }
     }
 
+    fn tx_state(&self, tx_id: u64) -> TxState {
+        if self.processed_tx_ids.contains(&tx_id) {
+            TxState::Processed
+        } else if self.known_transactions.contains_key(&tx_id) {
+            TxState::Unprocessed
+        } else if self.current_batch_standard_ids.contains(&tx_id) {
+            TxState::InBatch
+        } else {
+            TxState::Unseen
+        }
+    }
+
     fn observe_global_graph(&mut self, info: GlobalGraphInfo) {
         self.prune_missing_pairs(info.sequence);
 
         for pair in info.missing_edges {
             let (left, right) = pair;
-            if self.processed_tx_ids.contains(&left) || self.processed_tx_ids.contains(&right) {
+            let left_state = self.tx_state(left);
+            let right_state = self.tx_state(right);
+            if left_state == TxState::Processed || right_state == TxState::Processed {
                 continue;
             }
 
-            if !self.known_transactions.contains_key(&left)
-                && !self.known_transactions.contains_key(&right)
-            {
+            if left_state != TxState::Unprocessed && right_state != TxState::Unprocessed {
                 continue;
             }
 
@@ -446,7 +463,7 @@ impl BatchMaker {
     }
 
     fn record_missing_partner(&mut self, tx_id: u64, partner: u64) {
-        if !self.known_transactions.contains_key(&tx_id) {
+        if self.tx_state(tx_id) != TxState::Unprocessed {
             return;
         }
 
@@ -464,10 +481,9 @@ impl BatchMaker {
 
     fn unresolved_frontier_for_key(&self, state_key: u8) -> Option<u64> {
         self.unprocessed_by_key.get(&state_key).and_then(|tx_ids| {
-            tx_ids
-                .iter()
-                .copied()
-                .find(|tx_id| self.has_missing_partners(*tx_id))
+            tx_ids.iter().copied().find(|tx_id| {
+                self.tx_state(*tx_id) == TxState::Unprocessed && self.has_missing_partners(*tx_id)
+            })
         })
     }
 

@@ -519,6 +519,42 @@ fn drops_duplicate_unprocessed_standard_transactions() {
 }
 
 #[test]
+fn drops_reappearing_transactions_while_they_are_still_unprocessed() {
+    let (_tx_transaction, rx_transaction) = channel(1);
+    let (_tx_control, rx_control) = channel(1);
+    let (tx_message, _rx_message) = channel(1);
+
+    let mut batch_maker = BatchMaker {
+        name: PublicKey::default(),
+        batch_size: 1,
+        max_batch_delay: 1,
+        rx_transaction,
+        rx_control,
+        tx_message,
+        workers_addresses: Vec::new(),
+        current_batch: Vec::new(),
+        current_batch_standard_ids: HashSet::new(),
+        current_batch_size: 0,
+        network: ReliableSender::new(),
+        last_writer: HashMap::new(),
+        known_transactions: HashMap::new(),
+        unprocessed_by_key: HashMap::new(),
+        processed_tx_ids: HashSet::new(),
+        processed_tx_fifo: VecDeque::new(),
+        missing_partners_by_tx: HashMap::new(),
+        missing_pairs: HashSet::new(),
+        missing_pair_fifo: VecDeque::new(),
+        next_sequence: 0,
+    };
+
+    batch_maker.record_unprocessed(41, 9);
+
+    assert_eq!(batch_maker.tx_state(41), TxState::Unprocessed);
+    assert!(!batch_maker.accept_transaction(standard_transaction(41, 9)));
+    assert!(batch_maker.current_batch.is_empty());
+}
+
+#[test]
 fn processed_feedback_remembers_processed_txs_for_local_state_machine() {
     let (_tx_transaction, rx_transaction) = channel(1);
     let (_tx_control, rx_control) = channel(1);
