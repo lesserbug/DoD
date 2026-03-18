@@ -304,7 +304,8 @@ impl GlobalOrderer {
     async fn finalize_sequence(&mut self, sequence: u64, graphs: Vec<Batch>) -> bool {
         let name = self.name;
         let committee = self.committee.clone();
-        let accumulated_missing_support = self.accumulated_missing_support.clone();
+        let accumulated_missing_support =
+            Self::relevant_accumulated_missing_support(&graphs, &self.accumulated_missing_support);
         let global_batch = tokio::task::spawn_blocking(move || {
             Self::build_global_batch(
                 name,
@@ -371,7 +372,8 @@ impl GlobalOrderer {
     }
 
     fn observe_global_batch(&mut self, batch: &Batch) {
-        if self.committee.stake(&batch.author) == 0 {
+        let author_stake = self.committee.stake(&batch.author);
+        if author_stake == 0 {
             return;
         }
 
@@ -383,19 +385,52 @@ impl GlobalOrderer {
             .push_back((batch.sequence, batch_id));
         self.prune_observed_global_batches(batch.sequence);
 
+        let tx_ids: HashSet<_> = batch
+            .transactions
+            .iter()
+            .filter_map(|tx| parse_transaction_id_and_state_key(tx).map(|(tx_id, _)| tx_id))
+            .collect();
         for &(from, to) in &batch.missing_edges {
-            if from == to {
+            // Cross-round accumulation should only strengthen unresolved order
+            // between transactions that co-occurred in a global-order graph.
+            // External frontier pairs are kept for execution/batch-maker paths,
+            // but using them here as directional evidence would overstate
+            // support and widen the hot path.
+            if from == to || !tx_ids.contains(&from) || !tx_ids.contains(&to) {
                 continue;
             }
 
             *self
                 .accumulated_missing_support
                 .entry((from, to))
-                .or_insert(0) += 1;
+                .or_insert(0) += author_stake;
             self.accumulated_missing_support_fifo
                 .push_back((batch.sequence, (from, to)));
         }
         self.prune_accumulated_missing_support(batch.sequence);
+    }
+
+    fn relevant_accumulated_missing_support(
+        local_graphs: &[Batch],
+        accumulated_missing_support: &HashMap<(u64, u64), Stake>,
+    ) -> HashMap<(u64, u64), Stake> {
+        let active_tx_ids: HashSet<_> = local_graphs
+            .iter()
+            .flat_map(|graph| graph.transactions.iter())
+            .filter_map(|tx| parse_transaction_id_and_state_key(tx).map(|(tx_id, _)| tx_id))
+            .collect();
+
+        if active_tx_ids.is_empty() || accumulated_missing_support.is_empty() {
+            return HashMap::new();
+        }
+
+        accumulated_missing_support
+            .iter()
+            .filter_map(|(&(from, to), &support)| {
+                (active_tx_ids.contains(&from) || active_tx_ids.contains(&to))
+                    .then_some(((from, to), support))
+            })
+            .collect()
     }
 
     fn prune_observed_global_batches(&mut self, current_sequence: u64) {

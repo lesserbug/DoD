@@ -681,6 +681,89 @@ async fn accumulates_missing_support_across_global_rounds() {
 }
 
 #[tokio::test]
+async fn ignores_external_missing_pairs_when_accumulating_cross_round_support() {
+    let (name, _) = keys().pop().unwrap();
+    let committee = committee_with_base_port(14_288);
+    let peers: Vec<_> = committee
+        .others_workers(&name, &0)
+        .into_iter()
+        .map(|(peer, _)| peer)
+        .take(2)
+        .collect();
+
+    let (tx_own, rx_own) = channel(10);
+    let (tx_workers, rx_workers) = channel(10);
+    let (tx_workers_global, rx_workers_global) = channel(10);
+    let (tx_global, mut rx_global) = channel(10);
+
+    GlobalOrderer::spawn_with_global_sync_channel(
+        name,
+        committee,
+        rx_own,
+        rx_workers,
+        rx_workers_global,
+        tx_global,
+        vec![],
+    );
+
+    tx_workers_global
+        .send(make_global_batch_with_missing_edges(
+            peers[0],
+            0,
+            vec![standard_transaction(43, 5)],
+            vec![],
+            vec![(41, 43)],
+        ))
+        .await
+        .unwrap();
+
+    tx_own
+        .send(make_custom_local_graph(
+            name,
+            1,
+            vec![standard_transaction(41, 5), standard_transaction(43, 5)],
+            vec![(41, 43)],
+        ))
+        .await
+        .unwrap();
+
+    tx_workers
+        .send(make_custom_local_graph(
+            peers[0],
+            1,
+            vec![standard_transaction(41, 5), standard_transaction(43, 5)],
+            vec![],
+        ))
+        .await
+        .unwrap();
+
+    tx_workers
+        .send(make_custom_local_graph(
+            peers[1],
+            1,
+            vec![standard_transaction(41, 5), standard_transaction(43, 5)],
+            vec![],
+        ))
+        .await
+        .unwrap();
+
+    let serialized = rx_global
+        .recv()
+        .await
+        .expect("Global orderer did not output a global graph");
+
+    match bincode::deserialize(&serialized).unwrap() {
+        WorkerMessage::GlobalBatch(batch) => {
+            assert_eq!(batch.sequence, 1);
+            assert_eq!(tx_ids(&batch), vec![41, 43]);
+            assert!(batch.edges.is_empty());
+            assert_eq!(batch.missing_edges, vec![(41, 43)]);
+        }
+        other => panic!("Unexpected worker message: {:?}", other),
+    }
+}
+
+#[tokio::test]
 async fn keeps_only_frontier_promoted_in_batch_edges() {
     let (name, _) = keys().pop().unwrap();
     let committee = committee_with_base_port(14_290);
