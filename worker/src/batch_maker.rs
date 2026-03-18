@@ -101,6 +101,12 @@ enum TxState {
     Unseen,
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct CrossBatchDependency {
+    edge_predecessor: Option<u64>,
+    missing_predecessor: Option<u64>,
+}
+
 #[derive(Debug)]
 struct PendingObservationControl {
     sequence: u64,
@@ -383,23 +389,29 @@ impl BatchMaker {
         let mut edge_set = HashSet::new();
         let mut missing_edge_set = HashSet::new();
         let mut batch_writers: HashMap<u8, Vec<u64>> = HashMap::new();
-        let mut unresolved_frontiers = HashMap::new();
+        let mut cross_batch_dependencies = HashMap::new();
         for tx in &standard_txs {
-            if !unresolved_frontiers.contains_key(&tx.state_key) {
-                let frontier = self.unresolved_frontier_for_key(tx.state_key);
-                unresolved_frontiers.insert(tx.state_key, frontier);
+            if !cross_batch_dependencies.contains_key(&tx.state_key) {
+                let dependency = self.cross_batch_dependency_for_key(tx.state_key);
+                cross_batch_dependencies.insert(tx.state_key, dependency);
             }
         }
         for tx in &standard_txs {
-            if let Some(&prev_tx_id) = self.last_writer.get(&tx.state_key) {
+            if let Some(Some(prev_tx_id)) = cross_batch_dependencies
+                .get(&tx.state_key)
+                .map(|dependency| dependency.edge_predecessor)
+            {
                 if prev_tx_id != tx.tx_id {
                     edge_set.insert((prev_tx_id, tx.tx_id));
                 }
             }
 
-            if let Some(Some(frontier_tx_id)) = unresolved_frontiers.get(&tx.state_key) {
-                if *frontier_tx_id != tx.tx_id && !edge_set.contains(&(*frontier_tx_id, tx.tx_id)) {
-                    missing_edge_set.insert((*frontier_tx_id, tx.tx_id));
+            if let Some(Some(frontier_tx_id)) = cross_batch_dependencies
+                .get(&tx.state_key)
+                .map(|dependency| dependency.missing_predecessor)
+            {
+                if frontier_tx_id != tx.tx_id && !edge_set.contains(&(frontier_tx_id, tx.tx_id)) {
+                    missing_edge_set.insert((frontier_tx_id, tx.tx_id));
                 }
             }
 
@@ -692,6 +704,33 @@ impl BatchMaker {
         self.frontier_by_key
             .get(&state_key)
             .and_then(|tx_ids| tx_ids.front().copied())
+    }
+
+    fn cross_batch_dependency_for_key(&mut self, state_key: u8) -> CrossBatchDependency {
+        let unresolved_frontier = self.unresolved_frontier_for_key(state_key);
+        let Some(last_writer) = self.last_writer.get(&state_key).copied() else {
+            return CrossBatchDependency {
+                edge_predecessor: None,
+                missing_predecessor: unresolved_frontier,
+            };
+        };
+
+        if self.tx_state(last_writer) == TxState::Unprocessed
+            && self.has_missing_partners(last_writer)
+        {
+            // Once the latest local writer is itself still unresolved in M_w,
+            // treat it as a missing predecessor instead of a stable edge.
+            CrossBatchDependency {
+                edge_predecessor: None,
+                missing_predecessor: Some(last_writer),
+            }
+        } else {
+            CrossBatchDependency {
+                edge_predecessor: Some(last_writer),
+                missing_predecessor: unresolved_frontier
+                    .filter(|frontier| *frontier != last_writer),
+            }
+        }
     }
 
     fn prune_missing_pairs(&mut self, current_sequence: u64) {

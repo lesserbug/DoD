@@ -391,7 +391,7 @@ async fn processed_feedback_clears_local_missing_edge_carry_over() {
 }
 
 #[tokio::test]
-async fn local_missing_edges_only_use_the_oldest_unresolved_frontier_per_key() {
+async fn local_order_prefers_an_unresolved_last_writer_as_missing_predecessor() {
     let (tx_transaction, rx_transaction) = channel(5);
     let (tx_observation_control, rx_observation_control) = channel(5);
     let (_tx_processed_control, rx_processed_control) = channel(5);
@@ -457,8 +457,8 @@ async fn local_missing_edges_only_use_the_oldest_unresolved_frontier_per_key() {
     match bincode::deserialize(&third_batch).unwrap() {
         WorkerMessage::LocalBatch(batch) => {
             assert_eq!(batch.sequence, 2);
-            assert_eq!(batch.edges, vec![(42, 43)]);
-            assert_eq!(batch.missing_edges, vec![(41, 43)]);
+            assert!(batch.edges.is_empty());
+            assert_eq!(batch.missing_edges, vec![(42, 43)]);
         }
         _ => panic!("Unexpected message"),
     }
