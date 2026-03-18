@@ -356,9 +356,17 @@ impl GlobalOrderer {
         let mut edges =
             Self::build_weighted_edges(&nodes, &state_key, &edge_weights, pending_threshold);
         Self::retain_sccs_with_path_to_fixed(&mut nodes, &mut edges, &fixed_txs, &pending_txs);
+        let forwarded_in_batch_edges =
+            Self::collect_forwarded_in_batch_edges(&committee, &local_graphs, &nodes, pending_threshold);
+        for (from, to) in forwarded_in_batch_edges {
+            if !edges.contains(&(to, from)) {
+                edges.insert((from, to));
+            }
+        }
+
         let sccs = Self::tarjan_scc(&nodes, &edges);
         let component_index = Self::component_index(&sccs);
-        let forwarded_missing_edges = Self::collect_forwarded_missing_edges(
+        let forwarded_missing_edges = Self::collect_forwarded_external_missing_edges(
             &committee,
             &local_graphs,
             &nodes,
@@ -606,7 +614,38 @@ impl GlobalOrderer {
         missing_edges
     }
 
-    fn collect_forwarded_missing_edges(
+    fn collect_forwarded_in_batch_edges(
+        committee: &Committee,
+        local_graphs: &[Batch],
+        nodes: &HashSet<u64>,
+        threshold: Stake,
+    ) -> HashSet<(u64, u64)> {
+        let mut weights: HashMap<(u64, u64), Stake> = HashMap::new();
+
+        for graph in local_graphs {
+            let graph_stake = committee.stake(&graph.author);
+            let mut seen = HashSet::new();
+            for &(from, to) in &graph.missing_edges {
+                if from == to || !nodes.contains(&from) || !nodes.contains(&to) {
+                    continue;
+                }
+
+                if seen.insert((from, to)) {
+                    *weights.entry((from, to)).or_insert(0) += graph_stake;
+                }
+            }
+        }
+
+        weights
+            .iter()
+            .filter_map(|(&(from, to), &support)| {
+                let reverse_support = weights.get(&(to, from)).copied().unwrap_or(0);
+                (support >= threshold && support > reverse_support).then_some((from, to))
+            })
+            .collect()
+    }
+
+    fn collect_forwarded_external_missing_edges(
         committee: &Committee,
         local_graphs: &[Batch],
         nodes: &HashSet<u64>,
@@ -619,7 +658,9 @@ impl GlobalOrderer {
             let mut seen = HashSet::new();
             for &(from, to) in &graph.missing_edges {
                 let pair = if from <= to { (from, to) } else { (to, from) };
-                if pair.0 == pair.1 || !(nodes.contains(&pair.0) || nodes.contains(&pair.1)) {
+                let left_in = nodes.contains(&pair.0);
+                let right_in = nodes.contains(&pair.1);
+                if pair.0 == pair.1 || left_in == right_in {
                     continue;
                 }
 
