@@ -32,7 +32,7 @@ fn unique_store_path(prefix: &str) -> String {
 }
 
 #[test]
-fn executes_batches_with_kahn_order() {
+fn executes_same_batch_dependencies_before_using_fallback() {
     let batch = Batch {
         author: PublicKey::default(),
         sequence: 0,
@@ -45,13 +45,36 @@ fn executes_batches_with_kahn_order() {
         missing_edges: vec![(1, 3), (2, 3)],
     };
 
-    let ordered = Executor::execute_batch(&batch);
-    let tx_ids: Vec<_> = ordered
+    let execution = Executor::execute_batch(&batch);
+    let tx_ids: Vec<_> = execution
+        .transactions
         .iter()
         .filter_map(|tx| parse_transaction_id_and_state_key(tx).map(|(tx_id, _)| tx_id))
         .collect();
 
-    assert_eq!(tx_ids, vec![3, 1, 2]);
+    assert_eq!(tx_ids, vec![1, 2, 3]);
+    assert_eq!(execution.fallback_pair_count, 0);
+}
+
+#[test]
+fn uses_fallback_only_for_residual_same_batch_cycles() {
+    let batch = Batch {
+        author: PublicKey::default(),
+        sequence: 1,
+        transactions: vec![standard_transaction(1, 1), standard_transaction(2, 1)],
+        edges: Vec::new(),
+        missing_edges: vec![(1, 2), (2, 1)],
+    };
+
+    let execution = Executor::execute_batch(&batch);
+    let tx_ids: Vec<_> = execution
+        .transactions
+        .iter()
+        .filter_map(|tx| parse_transaction_id_and_state_key(tx).map(|(tx_id, _)| tx_id))
+        .collect();
+
+    assert_eq!(tx_ids, vec![1, 2]);
+    assert_eq!(execution.fallback_pair_count, 1);
 }
 
 #[test]
@@ -64,13 +87,15 @@ fn preserves_singleton_batches() {
         missing_edges: vec![(11, 11)],
     };
 
-    let ordered = Executor::execute_batch(&batch);
-    let tx_ids: Vec<_> = ordered
+    let execution = Executor::execute_batch(&batch);
+    let tx_ids: Vec<_> = execution
+        .transactions
         .iter()
         .filter_map(|tx| parse_transaction_id_and_state_key(tx).map(|(tx_id, _)| tx_id))
         .collect();
 
     assert_eq!(tx_ids, vec![11]);
+    assert_eq!(execution.fallback_pair_count, 0);
 }
 
 #[test]
@@ -97,7 +122,7 @@ fn queues_batches_with_unprocessed_external_missing_predecessors() {
     let summary = Executor::summarize_missing_edges(&batch);
 
     assert_eq!(summary.external_dependencies, vec![41]);
-    assert_eq!(summary.same_batch_pair_count, 0);
+    assert!(summary.same_batch_dependencies.is_empty());
     assert!(!Executor::batch_ready(
         &summary.external_dependencies,
         &HashSet::new()
@@ -123,7 +148,7 @@ fn external_missing_predecessors_ignore_same_batch_pairs() {
     let summary = Executor::summarize_missing_edges(&batch);
 
     assert_eq!(summary.external_dependencies, vec![41, 88]);
-    assert_eq!(summary.same_batch_pair_count, 1);
+    assert_eq!(summary.same_batch_dependencies, vec![(43, 44)]);
 }
 
 #[test]
@@ -138,7 +163,7 @@ fn same_batch_missing_pairs_do_not_block_batch_readiness() {
     let summary = Executor::summarize_missing_edges(&batch);
 
     assert!(summary.external_dependencies.is_empty());
-    assert_eq!(summary.same_batch_pair_count, 1);
+    assert_eq!(summary.same_batch_dependencies, vec![(43, 44)]);
     assert!(Executor::batch_ready(
         &summary.external_dependencies,
         &HashSet::new()

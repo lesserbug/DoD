@@ -16,10 +16,6 @@ use store::Store;
 use tokio::sync::mpsc::{error::TrySendError, Receiver, Sender};
 use tokio::time::{interval, Duration};
 
-
-
-
-
 #[cfg(test)]
 #[path = "tests/executor_tests.rs"]
 pub mod executor_tests;
@@ -28,7 +24,7 @@ struct PendingBatch {
     digest: Digest,
     batch: Batch,
     external_dependencies: Vec<u64>,
-    same_batch_pair_count: usize,
+    same_batch_dependencies: Vec<(u64, u64)>,
     first_seen_sequence: u64,
     stalled_rounds: u32,
 }
@@ -36,7 +32,12 @@ struct PendingBatch {
 #[derive(Default)]
 struct MissingEdgeSummary {
     external_dependencies: Vec<u64>,
-    same_batch_pair_count: usize,
+    same_batch_dependencies: Vec<(u64, u64)>,
+}
+
+struct BatchExecutionResult {
+    transactions: Vec<Transaction>,
+    fallback_pair_count: usize,
 }
 
 /// Executes globally ordered batches once the primary feeds back their ordered
@@ -191,7 +192,7 @@ impl Executor {
                             self.execute_and_feedback(
                                 digest,
                                 batch,
-                                missing_edge_summary.same_batch_pair_count,
+                                missing_edge_summary.same_batch_dependencies,
                             )
                             .await;
                             self.retry_pending_batches().await;
@@ -285,10 +286,25 @@ impl Executor {
             .all(|dependency| processed_tx_ids.contains(dependency))
     }
 
-    fn execute_batch(batch: &Batch) -> Vec<Transaction> {
+    #[cfg(test)]
+    fn execute_batch(batch: &Batch) -> BatchExecutionResult {
+        let missing_edge_summary = Self::summarize_missing_edges(batch);
+        Self::execute_batch_with_same_batch_dependencies(
+            batch,
+            &missing_edge_summary.same_batch_dependencies,
+        )
+    }
+
+    fn execute_batch_with_same_batch_dependencies(
+        batch: &Batch,
+        same_batch_dependencies: &[(u64, u64)],
+    ) -> BatchExecutionResult {
         let node_count = batch.transactions.len();
         if node_count <= 1 {
-            return batch.transactions.clone();
+            return BatchExecutionResult {
+                transactions: batch.transactions.clone(),
+                fallback_pair_count: 0,
+            };
         }
 
         let positions: HashMap<u64, usize> = batch
@@ -319,18 +335,24 @@ impl Executor {
             }
         }
 
-        // Cross-batch missing predecessors are handled by the local execution
-        // queue before we reach this point. For same-batch ambiguous pairs we
-        // still keep the finalized batch order as a deterministic tie-breaker.
-        for &(left, right) in &batch.missing_edges {
-            if let (Some(&left_index), Some(&right_index)) =
-                (positions.get(&left), positions.get(&right))
+        let mut same_batch_waiters: HashMap<usize, BTreeSet<usize>> = HashMap::new();
+        let mut unresolved_same_batch_predecessors = vec![0usize; node_count];
+        let mut seen_same_batch_dependencies = HashSet::new();
+        for &(predecessor, current) in same_batch_dependencies {
+            if let (Some(&predecessor_index), Some(&current_index)) =
+                (positions.get(&predecessor), positions.get(&current))
             {
-                if left_index < right_index {
-                    add_edge(left_index, right_index);
-                } else if right_index < left_index {
-                    add_edge(right_index, left_index);
+                if predecessor_index == current_index
+                    || !seen_same_batch_dependencies.insert((predecessor_index, current_index))
+                {
+                    continue;
                 }
+
+                same_batch_waiters
+                    .entry(predecessor_index)
+                    .or_default()
+                    .insert(current_index);
+                unresolved_same_batch_predecessors[current_index] += 1;
             }
         }
 
@@ -342,13 +364,41 @@ impl Executor {
         }
 
         let mut ordered = Vec::with_capacity(node_count);
-        while let Some(index) = ready.iter().next().copied() {
+        let mut emitted = vec![false; node_count];
+        let mut fallback_pair_count = 0usize;
+        while ordered.len() < node_count {
+            let index = ready
+                .iter()
+                .copied()
+                .find(|index| unresolved_same_batch_predecessors[*index] == 0)
+                .or_else(|| ready.iter().next().copied())
+                .or_else(|| (0..node_count).find(|index| !emitted[*index]))
+                .expect("batch execution lost track of remaining transactions");
             ready.remove(&index);
+            fallback_pair_count += unresolved_same_batch_predecessors[index];
+            emitted[index] = true;
             ordered.push(batch.transactions[index].clone());
 
             if let Some(neighbors) = adjacency.get(&index) {
                 for &next in neighbors {
+                    if emitted[next] {
+                        continue;
+                    }
                     indegree[next] -= 1;
+                    if indegree[next] == 0 {
+                        ready.insert(next);
+                    }
+                }
+            }
+
+            if let Some(waiters) = same_batch_waiters.get(&index) {
+                for &next in waiters {
+                    if emitted[next] {
+                        continue;
+                    }
+
+                    unresolved_same_batch_predecessors[next] =
+                        unresolved_same_batch_predecessors[next].saturating_sub(1);
                     if indegree[next] == 0 {
                         ready.insert(next);
                     }
@@ -356,31 +406,22 @@ impl Executor {
             }
         }
 
-        if ordered.len() < node_count {
-            let remaining: HashSet<_> = ordered
-                .iter()
-                .filter_map(|tx| parse_transaction_id_and_state_key(tx).map(|(tx_id, _)| tx_id))
-                .collect();
-            for tx in &batch.transactions {
-                match parse_transaction_id_and_state_key(tx) {
-                    Some((tx_id, _)) if remaining.contains(&tx_id) => {}
-                    _ => ordered.push(tx.clone()),
-                }
-            }
+        BatchExecutionResult {
+            transactions: ordered,
+            fallback_pair_count,
         }
-
-        ordered
     }
 
     async fn execute_and_feedback(
         &mut self,
         digest: Digest,
         batch: Batch,
-        same_batch_pair_count: usize,
+        same_batch_dependencies: Vec<(u64, u64)>,
     ) {
-        self.record_same_batch_fallback(same_batch_pair_count, batch.sequence, &digest);
-        let executed_transactions = Self::execute_batch(&batch);
-        let processed_tx_ids = Self::collect_processed_tx_ids(&executed_transactions);
+        let execution =
+            Self::execute_batch_with_same_batch_dependencies(&batch, &same_batch_dependencies);
+        self.record_same_batch_fallback(execution.fallback_pair_count, batch.sequence, &digest);
+        let processed_tx_ids = Self::collect_processed_tx_ids(&execution.transactions);
         self.remember_processed(&processed_tx_ids);
 
         if !processed_tx_ids.is_empty() {
@@ -391,10 +432,10 @@ impl Executor {
         }
 
         #[cfg(not(feature = "benchmark"))]
-        let _ = (&executed_transactions, self.benchmark_log_batches, digest);
+        let _ = (&execution.transactions, self.benchmark_log_batches, digest);
         #[cfg(feature = "benchmark")]
         if self.benchmark_log_batches {
-            Self::log_executed_batch(&digest, &executed_transactions);
+            Self::log_executed_batch(&digest, &execution.transactions);
         }
     }
 
@@ -417,7 +458,7 @@ impl Executor {
                     self.execute_and_feedback(
                         pending.digest,
                         pending.batch,
-                        pending.same_batch_pair_count,
+                        pending.same_batch_dependencies,
                     )
                     .await;
                     progressed = true;
@@ -466,7 +507,7 @@ impl Executor {
             digest,
             batch,
             external_dependencies: missing_edge_summary.external_dependencies,
-            same_batch_pair_count: missing_edge_summary.same_batch_pair_count,
+            same_batch_dependencies: missing_edge_summary.same_batch_dependencies,
             first_seen_sequence: self.latest_sequence,
             stalled_rounds: 0,
         });
@@ -485,18 +526,15 @@ impl Executor {
             .collect();
 
         let mut external_dependencies = Vec::new();
-        let mut same_batch_pairs = HashSet::new();
+        let mut same_batch_dependencies = BTreeSet::new();
         for &(left, right) in &batch.missing_edges {
             match (positions.contains(&left), positions.contains(&right)) {
                 (true, false) => external_dependencies.push(right),
                 (false, true) => external_dependencies.push(left),
                 (true, true) => {
-                    let pair = if left <= right {
-                        (left, right)
-                    } else {
-                        (right, left)
-                    };
-                    same_batch_pairs.insert(pair);
+                    if left != right {
+                        same_batch_dependencies.insert((left, right));
+                    }
                 }
                 _ => {}
             }
@@ -506,7 +544,7 @@ impl Executor {
         external_dependencies.dedup();
         MissingEdgeSummary {
             external_dependencies,
-            same_batch_pair_count: same_batch_pairs.len(),
+            same_batch_dependencies: same_batch_dependencies.into_iter().collect(),
         }
     }
 
