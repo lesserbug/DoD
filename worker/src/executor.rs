@@ -1,7 +1,7 @@
 // Copyright(C) Facebook, Inc. and its affiliates.
 use crate::batch_maker::{
     parse_standard_transaction, parse_transaction_id_and_state_key, Batch, BatchMakerControl,
-    Transaction,
+    GlobalGraphInfo, Transaction,
 };
 use crate::worker::WorkerMessage;
 use config::WorkerId;
@@ -62,6 +62,10 @@ pub struct Executor {
     pending_dependency_counts: HashMap<u64, usize>,
     /// Latest globally ordered sequence observed by this executor.
     latest_sequence: u64,
+    /// Best-effort observations temporarily buffered while the batch-maker
+    /// observation channel is saturated. This smooths bursts without blocking
+    /// the execution path or the processed-feedback path.
+    pending_observations: VecDeque<GlobalGraphInfo>,
     /// Number of dropped observe-global-graph control messages.
     dropped_observations: u64,
     /// Number of soft-limit queue health events emitted.
@@ -84,6 +88,9 @@ impl Executor {
     const MAX_PROCESSED_TX_IDS: usize = 65_536;
     const MAX_PENDING_BATCHES_SOFT: usize = 4_096;
     const MAX_PENDING_SEQUENCE_LAG_SOFT: u64 = 256;
+    const MAX_PENDING_OBSERVATIONS: usize = 1_024;
+    const OBSERVATION_FLUSH_BUDGET: usize = 16;
+    const OBSERVATION_IDLE_FLUSH_BUDGET: usize = 256;
     const HEALTH_LOG_INTERVAL: u64 = 64;
     const BENCHMARK_HEALTH_LOG_INTERVAL: u64 = 1_024;
     const METRICS_REPORT_INTERVAL_SECS: u64 = 5;
@@ -109,6 +116,7 @@ impl Executor {
                 pending_batches: VecDeque::new(),
                 pending_dependency_counts: HashMap::new(),
                 latest_sequence: 0,
+                pending_observations: VecDeque::new(),
                 dropped_observations: 0,
                 pending_health_events: 0,
                 processed_trim_blocked_events: 0,
@@ -128,6 +136,7 @@ impl Executor {
             tokio::select! {
                 message = self.rx_execute.recv() => {
                     let Some(ordered_batches) = message else {
+                        self.flush_observation_backlog(Self::OBSERVATION_IDLE_FLUSH_BUDGET);
                         self.log_metrics_snapshot();
                         break;
                     };
@@ -135,6 +144,8 @@ impl Executor {
                         if worker_id != self.id || !self.executed.insert(digest.clone()) {
                             continue;
                         }
+
+                        self.flush_observation_backlog(Self::OBSERVATION_FLUSH_BUDGET);
 
                         let serialized = match self.store.notify_read(digest.to_vec()).await {
                             Ok(bytes) => bytes,
@@ -167,23 +178,7 @@ impl Executor {
                         self.latest_sequence = self.latest_sequence.max(batch.sequence);
                         let missing_edge_summary = Self::summarize_missing_edges(&batch);
 
-                        if !batch.missing_edges.is_empty() {
-                            match self
-                                .tx_batch_observation
-                                .try_send(BatchMakerControl::observe_global_batch(&batch))
-                            {
-                                Ok(()) => {}
-                                Err(TrySendError::Full(_)) | Err(TrySendError::Closed(_)) => {
-                                    self.dropped_observations += 1;
-                                    if self.should_log_event(self.dropped_observations) {
-                                        warn!(
-                                            "Executor dropped {} global-graph observations while updating local M_w",
-                                            self.dropped_observations
-                                        );
-                                    }
-                                }
-                            }
-                        }
+                        self.observe_global_batch_best_effort(&batch);
 
                         if Self::batch_ready(
                             &missing_edge_summary.external_dependencies,
@@ -202,9 +197,81 @@ impl Executor {
                     }
                 }
                 _ = metrics_tick.tick() => {
+                    self.flush_observation_backlog(Self::OBSERVATION_IDLE_FLUSH_BUDGET);
                     self.log_metrics_snapshot();
                 }
             }
+        }
+    }
+
+    fn observe_global_batch_best_effort(&mut self, batch: &Batch) {
+        if batch.missing_edges.is_empty() {
+            return;
+        }
+
+        match self
+            .tx_batch_observation
+            .try_send(BatchMakerControl::observe_global_batch(batch))
+        {
+            Ok(()) => {}
+            Err(TrySendError::Full(BatchMakerControl::ObserveGlobalGraph(info))) => {
+                self.buffer_observation(info);
+            }
+            Err(TrySendError::Closed(BatchMakerControl::ObserveGlobalGraph(_))) => {
+                self.record_observation_drop();
+            }
+            Err(TrySendError::Full(_)) | Err(TrySendError::Closed(_)) => {
+                unreachable!("executor observation channel only carries ObserveGlobalGraph");
+            }
+        }
+    }
+
+    fn flush_observation_backlog(&mut self, budget: usize) {
+        let mut sent = 0usize;
+        while sent < budget {
+            let Some(info) = self.pending_observations.pop_front() else {
+                break;
+            };
+
+            match self
+                .tx_batch_observation
+                .try_send(BatchMakerControl::ObserveGlobalGraph(info))
+            {
+                Ok(()) => {
+                    sent += 1;
+                }
+                Err(TrySendError::Full(BatchMakerControl::ObserveGlobalGraph(info))) => {
+                    self.pending_observations.push_front(info);
+                    break;
+                }
+                Err(TrySendError::Closed(BatchMakerControl::ObserveGlobalGraph(_))) => {
+                    self.record_observation_drop();
+                    self.pending_observations.clear();
+                    break;
+                }
+                Err(TrySendError::Full(_)) | Err(TrySendError::Closed(_)) => {
+                    unreachable!("executor observation channel only carries ObserveGlobalGraph");
+                }
+            }
+        }
+    }
+
+    fn buffer_observation(&mut self, info: GlobalGraphInfo) {
+        if self.pending_observations.len() >= Self::MAX_PENDING_OBSERVATIONS {
+            self.pending_observations.pop_front();
+            self.record_observation_drop();
+        }
+
+        self.pending_observations.push_back(info);
+    }
+
+    fn record_observation_drop(&mut self) {
+        self.dropped_observations += 1;
+        if self.should_log_event(self.dropped_observations) {
+            warn!(
+                "Executor dropped {} global-graph observations while updating local M_w",
+                self.dropped_observations
+            );
         }
     }
 

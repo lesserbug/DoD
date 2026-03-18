@@ -3,6 +3,7 @@ use super::*;
 use crypto::PublicKey;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs;
+use std::time::{SystemTime, UNIX_EPOCH};
 use store::Store;
 use tokio::sync::mpsc::channel;
 
@@ -20,6 +21,14 @@ fn legacy_sample_transaction(id: u64) -> Transaction {
     tx.push(0u8);
     tx.extend_from_slice(&id.to_be_bytes());
     tx
+}
+
+fn unique_store_path(prefix: &str) -> String {
+    let suffix = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system time should be after unix epoch")
+        .as_nanos();
+    format!(".db_test_{}_{}", prefix, suffix)
 }
 
 #[test]
@@ -138,9 +147,11 @@ fn same_batch_missing_pairs_do_not_block_batch_readiness() {
 
 #[tokio::test]
 async fn trim_processed_to_cap_keeps_pending_dependencies_pinned() {
-    let path = ".db_test_executor_trim_processed_to_cap_keeps_pending_dependencies_pinned";
-    let _ = fs::remove_dir_all(path);
-    let store = Store::new(path).unwrap();
+    let path =
+        unique_store_path("executor_trim_processed_to_cap_keeps_pending_dependencies_pinned");
+    let _ = fs::remove_dir_all(&path);
+    let _ = fs::remove_file(&path);
+    let store = Store::new(&path).unwrap();
     let (_tx_execute, rx_execute) = channel(1);
     let (tx_observation, _rx_observation) = channel(1);
     let (tx_processed, _rx_processed) = channel(1);
@@ -157,6 +168,7 @@ async fn trim_processed_to_cap_keeps_pending_dependencies_pinned() {
         pending_batches: VecDeque::new(),
         pending_dependency_counts: HashMap::from([(41, 1usize)]),
         latest_sequence: 0,
+        pending_observations: VecDeque::new(),
         dropped_observations: 0,
         pending_health_events: 0,
         processed_trim_blocked_events: 0,
@@ -173,4 +185,70 @@ async fn trim_processed_to_cap_keeps_pending_dependencies_pinned() {
         executor.processed_fifo.iter().copied().collect::<Vec<_>>(),
         vec![41]
     );
+}
+
+#[tokio::test]
+async fn buffers_full_observation_channel_and_flushes_later() {
+    let path = unique_store_path("executor_buffers_full_observation_channel_and_flushes_later");
+    let _ = fs::remove_dir_all(&path);
+    let _ = fs::remove_file(&path);
+    let store = Store::new(&path).unwrap();
+    let (_tx_execute, rx_execute) = channel(1);
+    let (tx_observation, mut rx_observation) = channel(1);
+    let (tx_processed, _rx_processed) = channel(1);
+
+    let mut executor = Executor {
+        id: 0,
+        store,
+        rx_execute,
+        tx_batch_observation: tx_observation.clone(),
+        tx_batch_processed: tx_processed,
+        executed: HashSet::new(),
+        processed_tx_ids: HashSet::new(),
+        processed_fifo: VecDeque::new(),
+        pending_batches: VecDeque::new(),
+        pending_dependency_counts: HashMap::new(),
+        latest_sequence: 0,
+        pending_observations: VecDeque::new(),
+        dropped_observations: 0,
+        pending_health_events: 0,
+        processed_trim_blocked_events: 0,
+        same_batch_fallback_batches: 0,
+        same_batch_fallback_pairs: 0,
+        benchmark_log_batches: false,
+    };
+
+    tx_observation
+        .send(BatchMakerControl::ObserveGlobalGraph(GlobalGraphInfo {
+            sequence: 0,
+            tx_ids: Vec::new(),
+            missing_edges: vec![(1, 2)],
+        }))
+        .await
+        .unwrap();
+
+    let batch = Batch {
+        author: PublicKey::default(),
+        sequence: 1,
+        transactions: vec![standard_transaction(43, 9)],
+        edges: Vec::new(),
+        missing_edges: vec![(41, 43)],
+    };
+
+    executor.observe_global_batch_best_effort(&batch);
+
+    assert_eq!(executor.pending_observations.len(), 1);
+    assert_eq!(executor.dropped_observations, 0);
+
+    let _ = rx_observation.recv().await.unwrap();
+    executor.flush_observation_backlog(1);
+
+    match rx_observation.recv().await.unwrap() {
+        BatchMakerControl::ObserveGlobalGraph(info) => {
+            assert_eq!(info.sequence, 1);
+            assert_eq!(info.missing_edges, vec![(41, 43)]);
+        }
+        BatchMakerControl::MarkProcessed(_) => panic!("unexpected processed feedback"),
+    }
+    assert!(executor.pending_observations.is_empty());
 }
