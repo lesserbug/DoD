@@ -375,6 +375,7 @@ impl GlobalOrderer {
             &nodes,
             &reduced_edges,
             &state_key,
+            &edge_weights,
             &forwarded_in_batch_support,
             pending_threshold,
         );
@@ -647,7 +648,8 @@ impl GlobalOrderer {
         nodes: &HashSet<u64>,
         edges: &HashSet<(u64, u64)>,
         state_key: &HashMap<u64, u8>,
-        support: &HashMap<(u64, u64), Stake>,
+        edge_weights: &HashMap<(u64, u64), Stake>,
+        missing_support: &HashMap<(u64, u64), Stake>,
         threshold: Stake,
     ) -> HashSet<(u64, u64)> {
         let mut adjacency = Self::build_adjacency(nodes, edges);
@@ -664,12 +666,33 @@ impl GlobalOrderer {
         for tx_ids in txs_by_key.values() {
             for (index, &current) in tx_ids.iter().enumerate() {
                 for &candidate in tx_ids[..index].iter().rev() {
-                    let forward_support = support.get(&(candidate, current)).copied().unwrap_or(0);
+                    // Approximate Algorithm 2's pair weight by combining explicit
+                    // edge evidence from the current quorum with same-direction
+                    // missing-edge evidence already carried forward by workers.
+                    let forward_support = edge_weights
+                        .get(&(candidate, current))
+                        .copied()
+                        .unwrap_or(0)
+                        .saturating_add(
+                            missing_support
+                                .get(&(candidate, current))
+                                .copied()
+                                .unwrap_or(0),
+                        );
                     if forward_support < threshold {
                         continue;
                     }
 
-                    let reverse_support = support.get(&(current, candidate)).copied().unwrap_or(0);
+                    let reverse_support = edge_weights
+                        .get(&(current, candidate))
+                        .copied()
+                        .unwrap_or(0)
+                        .saturating_add(
+                            missing_support
+                                .get(&(current, candidate))
+                                .copied()
+                                .unwrap_or(0),
+                        );
                     if forward_support <= reverse_support
                         || Self::has_path_in_adjacency(candidate, current, &adjacency)
                     {
