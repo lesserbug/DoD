@@ -147,6 +147,8 @@ pub struct BatchMaker {
     workers_addresses: Vec<(PublicKey, SocketAddr)>,
     /// Holds the current batch of fresh client transactions.
     current_batch: Vec<Transaction>,
+    /// Standard transaction ids currently staged in the open local graph.
+    current_batch_standard_ids: HashSet<u64>,
     /// Holds the size of the current batch (in bytes).
     current_batch_size: usize,
     /// A network sender to broadcast the batches to the other workers.
@@ -162,6 +164,10 @@ pub struct BatchMaker {
     /// here so the Processed feedback loop does not retain payloads in the hot
     /// path.
     unprocessed_by_key: HashMap<u8, Vec<u64>>,
+    /// Recent processed transaction ids retained long enough to preserve the
+    /// local Processed/Unseen distinction without growing state unboundedly.
+    processed_tx_ids: HashSet<u64>,
+    processed_tx_fifo: VecDeque<u64>,
     /// Lightweight `M_w`: recent unresolved pairs touching locally known
     /// transactions, indexed by local tx id and bounded by age/size.
     missing_partners_by_tx: HashMap<u64, Vec<u64>>,
@@ -173,6 +179,7 @@ pub struct BatchMaker {
 
 impl BatchMaker {
     const MAX_CONTROL_MESSAGES_PER_TICK: usize = 64;
+    const MAX_PROCESSED_TX_IDS: usize = 65_536;
     const MAX_MISSING_PAIRS: usize = 4_096;
     const MAX_MISSING_PAIR_AGE: u64 = 128;
 
@@ -195,11 +202,14 @@ impl BatchMaker {
                 tx_message,
                 workers_addresses,
                 current_batch: Vec::with_capacity(batch_size * 2),
+                current_batch_standard_ids: HashSet::new(),
                 current_batch_size: 0,
                 network: ReliableSender::new(),
                 last_writer: HashMap::new(),
                 known_transactions: HashMap::new(),
                 unprocessed_by_key: HashMap::new(),
+                processed_tx_ids: HashSet::new(),
+                processed_tx_fifo: VecDeque::new(),
                 missing_partners_by_tx: HashMap::new(),
                 missing_pairs: HashSet::new(),
                 missing_pair_fifo: VecDeque::new(),
@@ -219,9 +229,9 @@ impl BatchMaker {
             tokio::select! {
                 // Assemble client transactions into batches of preset size.
                 Some(transaction) = self.rx_transaction.recv() => {
-                    self.current_batch_size += transaction.len();
-                    self.current_batch.push(transaction);
-                    if self.current_batch_size >= self.batch_size {
+                    if self.accept_transaction(transaction)
+                        && self.current_batch_size >= self.batch_size
+                    {
                         self.seal().await;
                         timer.as_mut().reset(Instant::now() + Duration::from_millis(self.max_batch_delay));
                     }
@@ -259,6 +269,7 @@ impl BatchMaker {
             .collect();
 
         self.current_batch_size = 0;
+        self.current_batch_standard_ids.clear();
         let transactions: Vec<_> = self.current_batch.drain(..).collect();
         let sequence = self.next_sequence;
 
@@ -371,6 +382,23 @@ impl BatchMaker {
         }
     }
 
+    fn accept_transaction(&mut self, transaction: Transaction) -> bool {
+        if let Some((tx_id, _)) = parse_standard_transaction(&transaction) {
+            if self.processed_tx_ids.contains(&tx_id)
+                || self.known_transactions.contains_key(&tx_id)
+                || self.current_batch_standard_ids.contains(&tx_id)
+            {
+                return false;
+            }
+
+            self.current_batch_standard_ids.insert(tx_id);
+        }
+
+        self.current_batch_size += transaction.len();
+        self.current_batch.push(transaction);
+        true
+    }
+
     fn handle_control(&mut self, control: BatchMakerControl) {
         match control {
             BatchMakerControl::ObserveGlobalGraph(info) => self.observe_global_graph(info),
@@ -392,6 +420,10 @@ impl BatchMaker {
 
         for pair in info.missing_edges {
             let (left, right) = pair;
+            if self.processed_tx_ids.contains(&left) || self.processed_tx_ids.contains(&right) {
+                continue;
+            }
+
             if !self.known_transactions.contains_key(&left)
                 && !self.known_transactions.contains_key(&right)
             {
@@ -483,6 +515,7 @@ impl BatchMaker {
         let mut touched_keys = HashSet::new();
 
         for tx_id in tx_ids {
+            self.remember_processed(tx_id);
             if let Some(state_key) = self.known_transactions.remove(&tx_id) {
                 touched_keys.insert(state_key);
                 if let Some(unprocessed) = self.unprocessed_by_key.get_mut(&state_key) {
@@ -500,6 +533,20 @@ impl BatchMaker {
             if should_remove {
                 self.unprocessed_by_key.remove(&state_key);
             }
+        }
+    }
+
+    fn remember_processed(&mut self, tx_id: u64) {
+        if !self.processed_tx_ids.insert(tx_id) {
+            return;
+        }
+
+        self.processed_tx_fifo.push_back(tx_id);
+        while self.processed_tx_fifo.len() > Self::MAX_PROCESSED_TX_IDS {
+            let Some(evicted) = self.processed_tx_fifo.pop_front() else {
+                break;
+            };
+            self.processed_tx_ids.remove(&evicted);
         }
     }
 
