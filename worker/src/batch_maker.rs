@@ -715,11 +715,11 @@ impl BatchMaker {
             };
         };
 
-        if self.tx_state(last_writer) == TxState::Unprocessed
-            && self.has_missing_partners(last_writer)
-        {
-            // Once the latest local writer is itself still unresolved in M_w,
-            // treat it as a missing predecessor instead of a stable edge.
+        if self.tx_state(last_writer) == TxState::Unprocessed && unresolved_frontier.is_some() {
+            // If any earlier local tx on this key is still unresolved, the
+            // current local last-writer remains tainted by that unresolved
+            // chain and should be carried as a missing predecessor rather than
+            // as a stable cross-batch edge.
             CrossBatchDependency {
                 edge_predecessor: None,
                 missing_predecessor: Some(last_writer),

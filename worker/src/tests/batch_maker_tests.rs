@@ -262,7 +262,7 @@ async fn local_order_keeps_cross_batch_last_writer_without_rebroadcasting_unreso
 }
 
 #[tokio::test]
-async fn observe_global_graph_turns_ambiguous_unprocessed_txs_into_local_missing_edges() {
+async fn unresolved_frontier_taints_later_local_last_writer() {
     let (tx_transaction, rx_transaction) = channel(4);
     let (tx_observation_control, rx_observation_control) = channel(4);
     let (_tx_processed_control, rx_processed_control) = channel(4);
@@ -317,8 +317,8 @@ async fn observe_global_graph_turns_ambiguous_unprocessed_txs_into_local_missing
         WorkerMessage::LocalBatch(batch) => {
             assert_eq!(batch.sequence, 2);
             assert_eq!(batch_tx_ids(&batch), vec![43]);
-            assert_eq!(batch.edges, vec![(42, 43)]);
-            assert_eq!(batch.missing_edges, vec![(41, 43)]);
+            assert!(batch.edges.is_empty());
+            assert_eq!(batch.missing_edges, vec![(42, 43)]);
         }
         _ => panic!("Unexpected message"),
     }
