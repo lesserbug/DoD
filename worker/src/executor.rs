@@ -44,8 +44,11 @@ pub struct Executor {
     store: Store,
     /// Ordered digests to execute, as fed back by the primary.
     rx_execute: Receiver<Vec<(Digest, WorkerId)>>,
-    /// Processed tx feedback sent back to the local batch maker.
-    tx_batch_control: Sender<BatchMakerControl>,
+    /// Best-effort global-graph observations sent back to the local batch
+    /// maker.
+    tx_batch_observation: Sender<BatchMakerControl>,
+    /// Priority processed tx feedback sent back to the local batch maker.
+    tx_batch_processed: Sender<BatchMakerControl>,
     /// Avoid re-executing the same committed digest.
     executed: HashSet<Digest>,
     /// Recent processed tx ids, kept long enough to release queued batches with
@@ -89,7 +92,8 @@ impl Executor {
         id: WorkerId,
         store: Store,
         rx_execute: Receiver<Vec<(Digest, WorkerId)>>,
-        tx_batch_control: Sender<BatchMakerControl>,
+        tx_batch_observation: Sender<BatchMakerControl>,
+        tx_batch_processed: Sender<BatchMakerControl>,
         benchmark_log_batches: bool,
     ) {
         tokio::spawn(async move {
@@ -97,7 +101,8 @@ impl Executor {
                 id,
                 store,
                 rx_execute,
-                tx_batch_control,
+                tx_batch_observation,
+                tx_batch_processed,
                 executed: HashSet::new(),
                 processed_tx_ids: HashSet::new(),
                 processed_fifo: VecDeque::new(),
@@ -164,7 +169,7 @@ impl Executor {
 
                         if !batch.missing_edges.is_empty() {
                             match self
-                                .tx_batch_control
+                                .tx_batch_observation
                                 .try_send(BatchMakerControl::observe_global_batch(&batch))
                             {
                                 Ok(()) => {}
@@ -308,7 +313,7 @@ impl Executor {
         self.remember_processed(&processed_tx_ids);
 
         if !processed_tx_ids.is_empty() {
-            self.tx_batch_control
+            self.tx_batch_processed
                 .send(BatchMakerControl::mark_processed(processed_tx_ids))
                 .await
                 .expect("Failed to send processed feedback to batch maker");

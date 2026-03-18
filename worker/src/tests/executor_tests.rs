@@ -142,13 +142,15 @@ async fn trim_processed_to_cap_keeps_pending_dependencies_pinned() {
     let _ = fs::remove_dir_all(path);
     let store = Store::new(path).unwrap();
     let (_tx_execute, rx_execute) = channel(1);
-    let (tx_control, _rx_control) = channel(1);
+    let (tx_observation, _rx_observation) = channel(1);
+    let (tx_processed, _rx_processed) = channel(1);
 
     let mut executor = Executor {
         id: 0,
         store,
         rx_execute,
-        tx_batch_control: tx_control,
+        tx_batch_observation: tx_observation,
+        tx_batch_processed: tx_processed,
         executed: HashSet::new(),
         processed_tx_ids: HashSet::from([41, 42]),
         processed_fifo: VecDeque::from([41, 42]),

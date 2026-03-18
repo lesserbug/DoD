@@ -14,7 +14,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 #[cfg(feature = "benchmark")]
 use std::convert::TryInto as _;
 use std::net::SocketAddr;
-use tokio::sync::mpsc::{Receiver, Sender};
+use tokio::sync::mpsc::{channel, Receiver, Sender};
 use tokio::time::{sleep, Duration, Instant};
 
 #[cfg(test)]
@@ -102,14 +102,14 @@ enum TxState {
 }
 
 #[derive(Debug)]
-enum PendingControl {
-    ObserveGlobalGraph {
-        sequence: u64,
-        missing_edges: VecDeque<(u64, u64)>,
-    },
-    MarkProcessed {
-        tx_ids: VecDeque<u64>,
-    },
+struct PendingObservationControl {
+    sequence: u64,
+    missing_edges: VecDeque<(u64, u64)>,
+}
+
+#[derive(Debug)]
+struct PendingProcessedControl {
+    tx_ids: VecDeque<u64>,
 }
 
 #[allow(dead_code)]
@@ -158,8 +158,10 @@ pub struct BatchMaker {
     max_batch_delay: u64,
     /// Channel to receive transactions from the network.
     rx_transaction: Receiver<Transaction>,
-    /// Channel to receive execution feedback from the worker-side executor.
-    rx_control: Receiver<BatchMakerControl>,
+    /// Best-effort observation channel fed by the worker-side executor.
+    rx_observation_control: Receiver<BatchMakerControl>,
+    /// Priority processed-feedback channel fed by the worker-side executor.
+    rx_processed_control: Receiver<BatchMakerControl>,
     /// Output channel to deliver sealed batches to the `QuorumWaiter`.
     tx_message: Sender<QuorumWaiterMessage>,
     /// The network addresses of the other workers that share our worker id.
@@ -187,6 +189,11 @@ pub struct BatchMaker {
     /// use this to trigger occasional local compaction without making every
     /// `MarkProcessed` update scan or rewrite the whole queue.
     stale_unprocessed_by_key: HashMap<u8, usize>,
+    /// Per-key queue of unresolved local tx ids that currently have missing
+    /// partners. This is the hot-path frontier index used when sealing the
+    /// next local graph.
+    frontier_by_key: HashMap<u8, VecDeque<u64>>,
+    frontier_tx_ids: HashSet<u64>,
     /// Recent processed transaction ids retained long enough to preserve the
     /// local Processed/Unseen distinction without growing state unboundedly.
     processed_tx_ids: HashSet<u64>,
@@ -196,7 +203,8 @@ pub struct BatchMaker {
     missing_partners_by_tx: HashMap<u64, HashSet<u64>>,
     missing_pairs: HashSet<(u64, u64)>,
     missing_pair_fifo: VecDeque<(u64, (u64, u64))>,
-    pending_controls: VecDeque<PendingControl>,
+    pending_observation_controls: VecDeque<PendingObservationControl>,
+    pending_processed_controls: VecDeque<PendingProcessedControl>,
     /// Sequence number of the next local-order graph.
     next_sequence: u64,
 }
@@ -209,7 +217,7 @@ impl BatchMaker {
     const MAX_PROCESSED_TX_IDS: usize = 65_536;
     const MAX_MISSING_PAIRS: usize = 4_096;
     const MAX_MISSING_PAIR_AGE: u64 = 128;
-    const MIN_STALE_UNPROCESSED_BEFORE_COMPACT: usize = 32;
+    const COMPAT_CONTROL_CHANNEL_CAPACITY: usize = 1_024;
 
     pub fn spawn(
         name: PublicKey,
@@ -220,13 +228,57 @@ impl BatchMaker {
         tx_message: Sender<QuorumWaiterMessage>,
         workers_addresses: Vec<(PublicKey, SocketAddr)>,
     ) {
+        let (tx_observation_control, rx_observation_control) =
+            channel(Self::COMPAT_CONTROL_CHANNEL_CAPACITY);
+        let (tx_processed_control, rx_processed_control) =
+            channel(Self::COMPAT_CONTROL_CHANNEL_CAPACITY);
+
+        tokio::spawn(async move {
+            let mut rx_control = rx_control;
+            while let Some(control) = rx_control.recv().await {
+                let result = match &control {
+                    BatchMakerControl::ObserveGlobalGraph(_) => {
+                        tx_observation_control.send(control).await
+                    }
+                    BatchMakerControl::MarkProcessed(_) => tx_processed_control.send(control).await,
+                };
+
+                if result.is_err() {
+                    break;
+                }
+            }
+        });
+
+        Self::spawn_with_control_channels(
+            name,
+            batch_size,
+            max_batch_delay,
+            rx_transaction,
+            rx_observation_control,
+            rx_processed_control,
+            tx_message,
+            workers_addresses,
+        );
+    }
+
+    pub fn spawn_with_control_channels(
+        name: PublicKey,
+        batch_size: usize,
+        max_batch_delay: u64,
+        rx_transaction: Receiver<Transaction>,
+        rx_observation_control: Receiver<BatchMakerControl>,
+        rx_processed_control: Receiver<BatchMakerControl>,
+        tx_message: Sender<QuorumWaiterMessage>,
+        workers_addresses: Vec<(PublicKey, SocketAddr)>,
+    ) {
         tokio::spawn(async move {
             Self {
                 name,
                 batch_size,
                 max_batch_delay,
                 rx_transaction,
-                rx_control,
+                rx_observation_control,
+                rx_processed_control,
                 tx_message,
                 workers_addresses,
                 current_batch: Vec::with_capacity(batch_size * 2),
@@ -237,12 +289,15 @@ impl BatchMaker {
                 known_transactions: HashMap::new(),
                 unprocessed_by_key: HashMap::new(),
                 stale_unprocessed_by_key: HashMap::new(),
+                frontier_by_key: HashMap::new(),
+                frontier_tx_ids: HashSet::new(),
                 processed_tx_ids: HashSet::new(),
                 processed_tx_fifo: VecDeque::new(),
                 missing_partners_by_tx: HashMap::new(),
                 missing_pairs: HashSet::new(),
                 missing_pair_fifo: VecDeque::new(),
-                pending_controls: VecDeque::new(),
+                pending_observation_controls: VecDeque::new(),
+                pending_processed_controls: VecDeque::new(),
                 next_sequence: 0,
             }
             .run()
@@ -421,20 +476,38 @@ impl BatchMaker {
     fn drain_control_backlog(&mut self, work_budget: usize) {
         let mut remaining_work = work_budget;
         while remaining_work > 0 {
-            if self.pending_controls.is_empty() {
-                let Ok(control) = self.rx_control.try_recv() else {
+            if self.pending_processed_controls.is_empty()
+                && self.pending_observation_controls.is_empty()
+            {
+                if !self.try_receive_control() {
                     break;
-                };
-                self.enqueue_control(control);
+                }
+            }
+
+            if self.pending_processed_controls.is_empty() {
+                self.try_receive_control();
+            }
+            if let Some(mut pending) = self.pending_processed_controls.pop_front() {
+                let spent = self.process_pending_processed_control(&mut pending, remaining_work);
+                if !pending.tx_ids.is_empty() {
+                    self.pending_processed_controls.push_front(pending);
+                }
+                if spent == 0 {
+                    break;
+                }
+                remaining_work = remaining_work.saturating_sub(spent);
                 continue;
             }
 
-            let Some(mut pending) = self.pending_controls.pop_front() else {
+            if self.pending_observation_controls.is_empty() {
+                self.try_receive_control();
+            }
+            let Some(mut pending) = self.pending_observation_controls.pop_front() else {
                 break;
             };
-            let spent = self.process_pending_control(&mut pending, remaining_work);
-            if !Self::pending_control_complete(&pending) {
-                self.pending_controls.push_front(pending);
+            let spent = self.process_pending_observation_control(&mut pending, remaining_work);
+            if !pending.missing_edges.is_empty() {
+                self.pending_observation_controls.push_front(pending);
             }
             if spent == 0 {
                 break;
@@ -476,8 +549,8 @@ impl BatchMaker {
             BatchMakerControl::ObserveGlobalGraph(info) => {
                 self.prune_missing_pairs(info.sequence);
                 if !info.missing_edges.is_empty() {
-                    self.pending_controls
-                        .push_back(PendingControl::ObserveGlobalGraph {
+                    self.pending_observation_controls
+                        .push_back(PendingObservationControl {
                             sequence: info.sequence,
                             missing_edges: info.missing_edges.into(),
                         });
@@ -485,8 +558,8 @@ impl BatchMaker {
             }
             BatchMakerControl::MarkProcessed(tx_ids) => {
                 if !tx_ids.is_empty() {
-                    self.pending_controls
-                        .push_back(PendingControl::MarkProcessed {
+                    self.pending_processed_controls
+                        .push_back(PendingProcessedControl {
                             tx_ids: tx_ids.into(),
                         });
                 }
@@ -494,47 +567,52 @@ impl BatchMaker {
         }
     }
 
-    fn process_pending_control(
+    fn process_pending_observation_control(
         &mut self,
-        pending: &mut PendingControl,
+        pending: &mut PendingObservationControl,
         work_budget: usize,
     ) -> usize {
-        match pending {
-            PendingControl::ObserveGlobalGraph {
-                sequence,
-                missing_edges,
-            } => {
-                let mut spent = 0;
-                while spent < work_budget {
-                    let Some(pair) = missing_edges.pop_front() else {
-                        break;
-                    };
-                    self.handle_observed_missing_pair(*sequence, pair);
-                    spent += 1;
-                }
-                spent
-            }
-            PendingControl::MarkProcessed { tx_ids } => {
-                let mut spent = 0;
-                let mut touched_keys = HashSet::new();
-                while spent < work_budget {
-                    let Some(tx_id) = tx_ids.pop_front() else {
-                        break;
-                    };
-                    self.mark_processed_one(tx_id, &mut touched_keys);
-                    spent += 1;
-                }
-                self.prune_empty_unprocessed_keys(touched_keys);
-                spent
-            }
+        let mut spent = 0;
+        while spent < work_budget {
+            let Some(pair) = pending.missing_edges.pop_front() else {
+                break;
+            };
+            self.handle_observed_missing_pair(pending.sequence, pair);
+            spent += 1;
         }
+        spent
     }
 
-    fn pending_control_complete(pending: &PendingControl) -> bool {
-        match pending {
-            PendingControl::ObserveGlobalGraph { missing_edges, .. } => missing_edges.is_empty(),
-            PendingControl::MarkProcessed { tx_ids } => tx_ids.is_empty(),
+    fn process_pending_processed_control(
+        &mut self,
+        pending: &mut PendingProcessedControl,
+        work_budget: usize,
+    ) -> usize {
+        let mut spent = 0;
+        let mut touched_keys = HashSet::new();
+        while spent < work_budget {
+            let Some(tx_id) = pending.tx_ids.pop_front() else {
+                break;
+            };
+            self.mark_processed_one(tx_id, &mut touched_keys);
+            spent += 1;
         }
+        self.prune_empty_unprocessed_keys(touched_keys);
+        spent
+    }
+
+    fn try_receive_control(&mut self) -> bool {
+        if let Ok(control) = self.rx_processed_control.try_recv() {
+            self.enqueue_control(control);
+            return true;
+        }
+
+        if let Ok(control) = self.rx_observation_control.try_recv() {
+            self.enqueue_control(control);
+            return true;
+        }
+
+        false
     }
 
     fn record_unprocessed(&mut self, tx_id: u64, state_key: u8) {
@@ -598,7 +676,9 @@ impl BatchMaker {
         }
 
         let partners = self.missing_partners_by_tx.entry(tx_id).or_default();
-        partners.insert(partner);
+        if partners.insert(partner) {
+            self.enqueue_frontier_tx(tx_id);
+        }
     }
 
     fn has_missing_partners(&self, tx_id: u64) -> bool {
@@ -608,13 +688,10 @@ impl BatchMaker {
     }
 
     fn unresolved_frontier_for_key(&mut self, state_key: u8) -> Option<u64> {
-        self.prune_unprocessed_prefix(state_key);
-        self.maybe_compact_unprocessed_key(state_key);
-        self.unprocessed_by_key.get(&state_key).and_then(|tx_ids| {
-            tx_ids.iter().copied().find(|tx_id| {
-                self.known_transactions.contains_key(tx_id) && self.has_missing_partners(*tx_id)
-            })
-        })
+        self.prune_frontier_queue(state_key);
+        self.frontier_by_key
+            .get(&state_key)
+            .and_then(|tx_ids| tx_ids.front().copied())
     }
 
     fn prune_missing_pairs(&mut self, current_sequence: u64) {
@@ -689,6 +766,49 @@ impl BatchMaker {
         }
     }
 
+    fn enqueue_frontier_tx(&mut self, tx_id: u64) {
+        let Some(&state_key) = self.known_transactions.get(&tx_id) else {
+            return;
+        };
+
+        if self.frontier_tx_ids.insert(tx_id) {
+            self.frontier_by_key
+                .entry(state_key)
+                .or_default()
+                .push_back(tx_id);
+        }
+    }
+
+    fn prune_frontier_queue(&mut self, state_key: u8) {
+        loop {
+            let tx_id = match self
+                .frontier_by_key
+                .get(&state_key)
+                .and_then(|queue| queue.front().copied())
+            {
+                Some(tx_id) => tx_id,
+                None => break,
+            };
+
+            if self.known_transactions.contains_key(&tx_id) && self.has_missing_partners(tx_id) {
+                break;
+            }
+
+            if let Some(queue) = self.frontier_by_key.get_mut(&state_key) {
+                queue.pop_front();
+            }
+            self.frontier_tx_ids.remove(&tx_id);
+        }
+
+        let should_remove = self
+            .frontier_by_key
+            .get(&state_key)
+            .map_or(false, VecDeque::is_empty);
+        if should_remove {
+            self.frontier_by_key.remove(&state_key);
+        }
+    }
+
     fn prune_unprocessed_prefix(&mut self, state_key: u8) {
         let known_transactions = &self.known_transactions;
         let mut removed = 0usize;
@@ -713,48 +833,6 @@ impl BatchMaker {
         if should_remove {
             self.unprocessed_by_key.remove(&state_key);
             self.stale_unprocessed_by_key.remove(&state_key);
-        }
-    }
-
-    fn maybe_compact_unprocessed_key(&mut self, state_key: u8) {
-        let stale = self
-            .stale_unprocessed_by_key
-            .get(&state_key)
-            .copied()
-            .unwrap_or(0);
-        if stale < Self::MIN_STALE_UNPROCESSED_BEFORE_COMPACT {
-            return;
-        }
-
-        let len = self
-            .unprocessed_by_key
-            .get(&state_key)
-            .map_or(0, VecDeque::len);
-        if len == 0 || stale.saturating_mul(2) < len {
-            return;
-        }
-
-        let known_transactions = &self.known_transactions;
-        let should_remove = match self.unprocessed_by_key.get_mut(&state_key) {
-            Some(unprocessed) => {
-                let mut compacted =
-                    VecDeque::with_capacity(unprocessed.len().saturating_sub(stale));
-                while let Some(tx_id) = unprocessed.pop_front() {
-                    if known_transactions.contains_key(&tx_id) {
-                        compacted.push_back(tx_id);
-                    }
-                }
-                *unprocessed = compacted;
-                unprocessed.is_empty()
-            }
-            None => false,
-        };
-
-        if should_remove {
-            self.unprocessed_by_key.remove(&state_key);
-            self.stale_unprocessed_by_key.remove(&state_key);
-        } else {
-            self.stale_unprocessed_by_key.insert(state_key, 0);
         }
     }
 

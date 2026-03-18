@@ -79,7 +79,8 @@ impl Worker {
         let (tx_own_local, rx_own_local) = channel(CHANNEL_CAPACITY);
         let (tx_workers_local, rx_workers_local) = channel(CHANNEL_CAPACITY);
         let (tx_global, rx_global) = channel(CHANNEL_CAPACITY);
-        let (tx_batch_control, rx_batch_control) = channel(CHANNEL_CAPACITY);
+        let (tx_batch_observation, rx_batch_observation) = channel(CHANNEL_CAPACITY);
+        let (tx_batch_processed, rx_batch_processed) = channel(CHANNEL_CAPACITY);
 
         GlobalOrderer::spawn(
             worker.name,
@@ -95,12 +96,17 @@ impl Worker {
                 .collect(),
         );
 
-        worker.handle_primary_messages(benchmark_canonical, tx_batch_control.clone());
+        worker.handle_primary_messages(
+            benchmark_canonical,
+            tx_batch_observation.clone(),
+            tx_batch_processed.clone(),
+        );
         worker.handle_clients_transactions(
             tx_primary.clone(),
             tx_own_local,
             rx_global,
-            rx_batch_control,
+            rx_batch_observation,
+            rx_batch_processed,
             benchmark_canonical,
         );
         worker.handle_workers_messages(tx_primary, tx_workers_local);
@@ -132,7 +138,8 @@ impl Worker {
     fn handle_primary_messages(
         &self,
         benchmark_log_execution: bool,
-        tx_batch_control: Sender<BatchMakerControl>,
+        tx_batch_observation: Sender<BatchMakerControl>,
+        tx_batch_processed: Sender<BatchMakerControl>,
     ) {
         let (tx_synchronizer, rx_synchronizer) = channel(CHANNEL_CAPACITY);
         let (tx_executor, rx_executor) = channel(CHANNEL_CAPACITY);
@@ -170,7 +177,8 @@ impl Worker {
             self.id,
             self.store.clone(),
             /* rx_execute */ rx_executor,
-            tx_batch_control,
+            tx_batch_observation,
+            tx_batch_processed,
             benchmark_log_execution,
         );
 
@@ -186,7 +194,8 @@ impl Worker {
         tx_primary: Sender<SerializedBatchDigestMessage>,
         tx_own_local: Sender<SerializedBatchMessage>,
         rx_global: tokio::sync::mpsc::Receiver<SerializedBatchMessage>,
-        rx_batch_control: tokio::sync::mpsc::Receiver<BatchMakerControl>,
+        rx_batch_observation: tokio::sync::mpsc::Receiver<BatchMakerControl>,
+        rx_batch_processed: tokio::sync::mpsc::Receiver<BatchMakerControl>,
         benchmark_canonical: bool,
     ) {
         let (tx_batch_maker, rx_batch_maker) = channel(CHANNEL_CAPACITY);
@@ -206,12 +215,13 @@ impl Worker {
 
         // The transactions are sent to the `BatchMaker` that assembles them into local-order graphs. It then
         // broadcasts these local graphs to all workers with the same `id`.
-        BatchMaker::spawn(
+        BatchMaker::spawn_with_control_channels(
             self.name,
             self.parameters.batch_size,
             self.parameters.max_batch_delay,
             /* rx_transaction */ rx_batch_maker,
-            /* rx_control */ rx_batch_control,
+            /* rx_observation_control */ rx_batch_observation,
+            /* rx_processed_control */ rx_batch_processed,
             /* tx_message */ tx_quorum_waiter,
             /* workers_addresses */
             self.committee

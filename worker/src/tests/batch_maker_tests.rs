@@ -264,16 +264,18 @@ async fn local_order_keeps_cross_batch_last_writer_without_rebroadcasting_unreso
 #[tokio::test]
 async fn observe_global_graph_turns_ambiguous_unprocessed_txs_into_local_missing_edges() {
     let (tx_transaction, rx_transaction) = channel(4);
-    let (tx_control, rx_control) = channel(4);
+    let (tx_observation_control, rx_observation_control) = channel(4);
+    let (_tx_processed_control, rx_processed_control) = channel(4);
     let (tx_message, mut rx_message) = channel(4);
     let dummy_addresses = vec![(PublicKey::default(), "127.0.0.1:0".parse().unwrap())];
 
-    BatchMaker::spawn(
+    BatchMaker::spawn_with_control_channels(
         PublicKey::default(),
         /* max_batch_size */ 100,
         /* max_batch_delay */ 1_000_000,
         rx_transaction,
-        rx_control,
+        rx_observation_control,
+        rx_processed_control,
         tx_message,
         dummy_addresses,
     );
@@ -297,7 +299,7 @@ async fn observe_global_graph_turns_ambiguous_unprocessed_txs_into_local_missing
         edges: Vec::new(),
         missing_edges: vec![(41, 500)],
     };
-    tx_control
+    tx_observation_control
         .send(BatchMakerControl::observe_global_batch(&observed_batch))
         .await
         .unwrap();
@@ -325,16 +327,18 @@ async fn observe_global_graph_turns_ambiguous_unprocessed_txs_into_local_missing
 #[tokio::test]
 async fn processed_feedback_clears_local_missing_edge_carry_over() {
     let (tx_transaction, rx_transaction) = channel(4);
-    let (tx_control, rx_control) = channel(4);
+    let (tx_observation_control, rx_observation_control) = channel(4);
+    let (tx_processed_control, rx_processed_control) = channel(4);
     let (tx_message, mut rx_message) = channel(4);
     let dummy_addresses = vec![(PublicKey::default(), "127.0.0.1:0".parse().unwrap())];
 
-    BatchMaker::spawn(
+    BatchMaker::spawn_with_control_channels(
         PublicKey::default(),
         /* max_batch_size */ 100,
         /* max_batch_delay */ 1_000_000,
         rx_transaction,
-        rx_control,
+        rx_observation_control,
+        rx_processed_control,
         tx_message,
         dummy_addresses,
     );
@@ -358,11 +362,11 @@ async fn processed_feedback_clears_local_missing_edge_carry_over() {
         edges: Vec::new(),
         missing_edges: vec![(41, 500)],
     };
-    tx_control
+    tx_observation_control
         .send(BatchMakerControl::observe_global_batch(&observed_batch))
         .await
         .unwrap();
-    tx_control
+    tx_processed_control
         .send(BatchMakerControl::mark_processed(vec![41]))
         .await
         .unwrap();
@@ -389,16 +393,18 @@ async fn processed_feedback_clears_local_missing_edge_carry_over() {
 #[tokio::test]
 async fn local_missing_edges_only_use_the_oldest_unresolved_frontier_per_key() {
     let (tx_transaction, rx_transaction) = channel(5);
-    let (tx_control, rx_control) = channel(5);
+    let (tx_observation_control, rx_observation_control) = channel(5);
+    let (_tx_processed_control, rx_processed_control) = channel(5);
     let (tx_message, mut rx_message) = channel(5);
     let dummy_addresses = vec![(PublicKey::default(), "127.0.0.1:0".parse().unwrap())];
 
-    BatchMaker::spawn(
+    BatchMaker::spawn_with_control_channels(
         PublicKey::default(),
         /* max_batch_size */ 100,
         /* max_batch_delay */ 1_000_000,
         rx_transaction,
-        rx_control,
+        rx_observation_control,
+        rx_processed_control,
         tx_message,
         dummy_addresses,
     );
@@ -422,7 +428,7 @@ async fn local_missing_edges_only_use_the_oldest_unresolved_frontier_per_key() {
         edges: Vec::new(),
         missing_edges: vec![(41, 500)],
     };
-    tx_control
+    tx_observation_control
         .send(BatchMakerControl::observe_global_batch(&first_observation))
         .await
         .unwrap();
@@ -434,7 +440,7 @@ async fn local_missing_edges_only_use_the_oldest_unresolved_frontier_per_key() {
         edges: Vec::new(),
         missing_edges: vec![(42, 600)],
     };
-    tx_control
+    tx_observation_control
         .send(BatchMakerControl::observe_global_batch(&second_observation))
         .await
         .unwrap();
@@ -485,7 +491,8 @@ fn observe_global_batch_canonicalizes_missing_edges() {
 #[test]
 fn drops_duplicate_unprocessed_standard_transactions() {
     let (_tx_transaction, rx_transaction) = channel(1);
-    let (_tx_control, rx_control) = channel(1);
+    let (_tx_observation_control, rx_observation_control) = channel(1);
+    let (_tx_processed_control, rx_processed_control) = channel(1);
     let (tx_message, _rx_message) = channel(1);
 
     let mut batch_maker = BatchMaker {
@@ -493,7 +500,8 @@ fn drops_duplicate_unprocessed_standard_transactions() {
         batch_size: 1,
         max_batch_delay: 1,
         rx_transaction,
-        rx_control,
+        rx_observation_control,
+        rx_processed_control,
         tx_message,
         workers_addresses: Vec::new(),
         current_batch: Vec::new(),
@@ -504,12 +512,15 @@ fn drops_duplicate_unprocessed_standard_transactions() {
         known_transactions: HashMap::new(),
         unprocessed_by_key: HashMap::new(),
         stale_unprocessed_by_key: HashMap::new(),
+        frontier_by_key: HashMap::new(),
+        frontier_tx_ids: HashSet::new(),
         processed_tx_ids: HashSet::new(),
         processed_tx_fifo: VecDeque::new(),
         missing_partners_by_tx: HashMap::new(),
         missing_pairs: HashSet::new(),
         missing_pair_fifo: VecDeque::new(),
-        pending_controls: VecDeque::new(),
+        pending_observation_controls: VecDeque::new(),
+        pending_processed_controls: VecDeque::new(),
         next_sequence: 0,
     };
 
@@ -530,7 +541,8 @@ fn drops_duplicate_unprocessed_standard_transactions() {
 #[test]
 fn drops_reappearing_transactions_while_they_are_still_unprocessed() {
     let (_tx_transaction, rx_transaction) = channel(1);
-    let (_tx_control, rx_control) = channel(1);
+    let (_tx_observation_control, rx_observation_control) = channel(1);
+    let (_tx_processed_control, rx_processed_control) = channel(1);
     let (tx_message, _rx_message) = channel(1);
 
     let mut batch_maker = BatchMaker {
@@ -538,7 +550,8 @@ fn drops_reappearing_transactions_while_they_are_still_unprocessed() {
         batch_size: 1,
         max_batch_delay: 1,
         rx_transaction,
-        rx_control,
+        rx_observation_control,
+        rx_processed_control,
         tx_message,
         workers_addresses: Vec::new(),
         current_batch: Vec::new(),
@@ -549,12 +562,15 @@ fn drops_reappearing_transactions_while_they_are_still_unprocessed() {
         known_transactions: HashMap::new(),
         unprocessed_by_key: HashMap::new(),
         stale_unprocessed_by_key: HashMap::new(),
+        frontier_by_key: HashMap::new(),
+        frontier_tx_ids: HashSet::new(),
         processed_tx_ids: HashSet::new(),
         processed_tx_fifo: VecDeque::new(),
         missing_partners_by_tx: HashMap::new(),
         missing_pairs: HashSet::new(),
         missing_pair_fifo: VecDeque::new(),
-        pending_controls: VecDeque::new(),
+        pending_observation_controls: VecDeque::new(),
+        pending_processed_controls: VecDeque::new(),
         next_sequence: 0,
     };
 
@@ -568,7 +584,8 @@ fn drops_reappearing_transactions_while_they_are_still_unprocessed() {
 #[test]
 fn processed_feedback_marks_processed_state_for_control_path() {
     let (_tx_transaction, rx_transaction) = channel(1);
-    let (_tx_control, rx_control) = channel(1);
+    let (_tx_observation_control, rx_observation_control) = channel(1);
+    let (_tx_processed_control, rx_processed_control) = channel(1);
     let (tx_message, _rx_message) = channel(1);
 
     let mut batch_maker = BatchMaker {
@@ -576,7 +593,8 @@ fn processed_feedback_marks_processed_state_for_control_path() {
         batch_size: 1,
         max_batch_delay: 1,
         rx_transaction,
-        rx_control,
+        rx_observation_control,
+        rx_processed_control,
         tx_message,
         workers_addresses: Vec::new(),
         current_batch: Vec::new(),
@@ -587,12 +605,15 @@ fn processed_feedback_marks_processed_state_for_control_path() {
         known_transactions: HashMap::new(),
         unprocessed_by_key: HashMap::new(),
         stale_unprocessed_by_key: HashMap::new(),
+        frontier_by_key: HashMap::new(),
+        frontier_tx_ids: HashSet::new(),
         processed_tx_ids: HashSet::new(),
         processed_tx_fifo: VecDeque::new(),
         missing_partners_by_tx: HashMap::new(),
         missing_pairs: HashSet::new(),
         missing_pair_fifo: VecDeque::new(),
-        pending_controls: VecDeque::new(),
+        pending_observation_controls: VecDeque::new(),
+        pending_processed_controls: VecDeque::new(),
         next_sequence: 0,
     };
 
@@ -613,7 +634,8 @@ fn processed_feedback_marks_processed_state_for_control_path() {
 #[test]
 fn processed_feedback_prunes_unprocessed_state_without_retaining_payloads() {
     let (_tx_transaction, rx_transaction) = channel(1);
-    let (_tx_control, rx_control) = channel(1);
+    let (_tx_observation_control, rx_observation_control) = channel(1);
+    let (_tx_processed_control, rx_processed_control) = channel(1);
     let (tx_message, _rx_message) = channel(1);
 
     let mut batch_maker = BatchMaker {
@@ -621,7 +643,8 @@ fn processed_feedback_prunes_unprocessed_state_without_retaining_payloads() {
         batch_size: 1,
         max_batch_delay: 1,
         rx_transaction,
-        rx_control,
+        rx_observation_control,
+        rx_processed_control,
         tx_message,
         workers_addresses: Vec::new(),
         current_batch: Vec::new(),
@@ -632,12 +655,15 @@ fn processed_feedback_prunes_unprocessed_state_without_retaining_payloads() {
         known_transactions: HashMap::new(),
         unprocessed_by_key: HashMap::new(),
         stale_unprocessed_by_key: HashMap::new(),
+        frontier_by_key: HashMap::new(),
+        frontier_tx_ids: HashSet::new(),
         processed_tx_ids: HashSet::new(),
         processed_tx_fifo: VecDeque::new(),
         missing_partners_by_tx: HashMap::new(),
         missing_pairs: HashSet::new(),
         missing_pair_fifo: VecDeque::new(),
-        pending_controls: VecDeque::new(),
+        pending_observation_controls: VecDeque::new(),
+        pending_processed_controls: VecDeque::new(),
         next_sequence: 0,
     };
 
@@ -656,7 +682,8 @@ fn processed_feedback_prunes_unprocessed_state_without_retaining_payloads() {
 #[test]
 fn drain_control_backlog_limits_work_not_whole_messages() {
     let (_tx_transaction, rx_transaction) = channel(1);
-    let (_tx_control, rx_control) = channel(1);
+    let (_tx_observation_control, rx_observation_control) = channel(1);
+    let (_tx_processed_control, rx_processed_control) = channel(1);
     let (tx_message, _rx_message) = channel(1);
 
     let mut batch_maker = BatchMaker {
@@ -664,7 +691,8 @@ fn drain_control_backlog_limits_work_not_whole_messages() {
         batch_size: 1,
         max_batch_delay: 1,
         rx_transaction,
-        rx_control,
+        rx_observation_control,
+        rx_processed_control,
         tx_message,
         workers_addresses: Vec::new(),
         current_batch: Vec::new(),
@@ -675,12 +703,15 @@ fn drain_control_backlog_limits_work_not_whole_messages() {
         known_transactions: HashMap::new(),
         unprocessed_by_key: HashMap::new(),
         stale_unprocessed_by_key: HashMap::new(),
+        frontier_by_key: HashMap::new(),
+        frontier_tx_ids: HashSet::new(),
         processed_tx_ids: HashSet::new(),
         processed_tx_fifo: VecDeque::new(),
         missing_partners_by_tx: HashMap::new(),
         missing_pairs: HashSet::new(),
         missing_pair_fifo: VecDeque::new(),
-        pending_controls: VecDeque::new(),
+        pending_observation_controls: VecDeque::new(),
+        pending_processed_controls: VecDeque::new(),
         next_sequence: 0,
     };
 
@@ -694,17 +725,18 @@ fn drain_control_backlog_limits_work_not_whole_messages() {
     assert!(!batch_maker.processed_tx_ids.contains(&42));
     assert_eq!(batch_maker.known_transactions.get(&41), None);
     assert_eq!(batch_maker.known_transactions.get(&42), Some(&9));
-    assert_eq!(batch_maker.pending_controls.len(), 1);
+    assert_eq!(batch_maker.pending_processed_controls.len(), 1);
 
     batch_maker.drain_control_backlog(1);
     assert!(batch_maker.processed_tx_ids.contains(&42));
-    assert!(batch_maker.pending_controls.is_empty());
+    assert!(batch_maker.pending_processed_controls.is_empty());
 }
 
 #[test]
-fn unresolved_frontier_compacts_dirty_key_queues() {
+fn unresolved_frontier_prunes_stale_frontier_candidates() {
     let (_tx_transaction, rx_transaction) = channel(1);
-    let (_tx_control, rx_control) = channel(1);
+    let (_tx_observation_control, rx_observation_control) = channel(1);
+    let (_tx_processed_control, rx_processed_control) = channel(1);
     let (tx_message, _rx_message) = channel(1);
 
     let mut batch_maker = BatchMaker {
@@ -712,7 +744,8 @@ fn unresolved_frontier_compacts_dirty_key_queues() {
         batch_size: 1,
         max_batch_delay: 1,
         rx_transaction,
-        rx_control,
+        rx_observation_control,
+        rx_processed_control,
         tx_message,
         workers_addresses: Vec::new(),
         current_batch: Vec::new(),
@@ -723,29 +756,34 @@ fn unresolved_frontier_compacts_dirty_key_queues() {
         known_transactions: HashMap::new(),
         unprocessed_by_key: HashMap::new(),
         stale_unprocessed_by_key: HashMap::new(),
+        frontier_by_key: HashMap::new(),
+        frontier_tx_ids: HashSet::new(),
         processed_tx_ids: HashSet::new(),
         processed_tx_fifo: VecDeque::new(),
         missing_partners_by_tx: HashMap::new(),
         missing_pairs: HashSet::new(),
         missing_pair_fifo: VecDeque::new(),
-        pending_controls: VecDeque::new(),
+        pending_observation_controls: VecDeque::new(),
+        pending_processed_controls: VecDeque::new(),
         next_sequence: 0,
     };
 
     for tx_id in 1..=64 {
         batch_maker.record_unprocessed(tx_id, 9);
     }
-    batch_maker.handle_control(BatchMakerControl::mark_processed((33..=64).collect()));
     batch_maker.observe_global_graph(GlobalGraphInfo {
         sequence: 0,
-        tx_ids: vec![1, 500],
-        missing_edges: vec![(1, 500)],
+        tx_ids: vec![1, 33, 500, 600],
+        missing_edges: vec![(1, 500), (33, 600)],
     });
+    batch_maker.handle_control(BatchMakerControl::mark_processed(vec![1]));
 
-    assert_eq!(batch_maker.unresolved_frontier_for_key(9), Some(1));
+    assert_eq!(batch_maker.unresolved_frontier_for_key(9), Some(33));
     assert_eq!(
-        queued_unprocessed_ids(&batch_maker, 9),
-        Some((1..=32).collect())
+        batch_maker
+            .frontier_by_key
+            .get(&9)
+            .map(|queue| queue.iter().copied().collect::<Vec<_>>()),
+        Some(vec![33])
     );
-    assert_eq!(batch_maker.stale_unprocessed_by_key.get(&9), Some(&0));
 }
