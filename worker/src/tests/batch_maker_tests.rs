@@ -555,7 +555,7 @@ fn drops_reappearing_transactions_while_they_are_still_unprocessed() {
 }
 
 #[test]
-fn processed_feedback_remembers_processed_txs_for_local_state_machine() {
+fn processed_feedback_marks_processed_state_for_control_path() {
     let (_tx_transaction, rx_transaction) = channel(1);
     let (_tx_control, rx_control) = channel(1);
     let (tx_message, _rx_message) = channel(1);
@@ -587,8 +587,14 @@ fn processed_feedback_remembers_processed_txs_for_local_state_machine() {
     batch_maker.handle_control(BatchMakerControl::mark_processed(vec![41]));
 
     assert!(batch_maker.processed_tx_ids.contains(&41));
-    assert!(!batch_maker.accept_transaction(standard_transaction(41, 9)));
-    assert!(batch_maker.current_batch.is_empty());
+    assert_eq!(batch_maker.tx_state(41), TxState::Processed);
+
+    batch_maker.observe_global_graph(GlobalGraphInfo {
+        sequence: 0,
+        tx_ids: vec![41, 500],
+        missing_edges: vec![(41, 500)],
+    });
+    assert!(batch_maker.missing_pairs.is_empty());
 }
 
 #[test]

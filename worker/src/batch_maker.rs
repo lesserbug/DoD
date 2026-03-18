@@ -392,7 +392,14 @@ impl BatchMaker {
 
     fn accept_transaction(&mut self, transaction: Transaction) -> bool {
         if let Some((tx_id, _)) = parse_standard_transaction(&transaction) {
-            if self.tx_state(tx_id) != TxState::Unseen {
+            // Keep the local state machine explicit, but avoid paying the
+            // Processed-set lookup on every fresh transaction. Until the full
+            // Algorithm 1 state machine is in place, hot-path duplicate
+            // filtering only blocks txs already staged in the open batch or
+            // still locally Unprocessed.
+            if self.current_batch_standard_ids.contains(&tx_id)
+                || self.known_transactions.contains_key(&tx_id)
+            {
                 return false;
             }
 
