@@ -57,7 +57,8 @@ pub struct GlobalOrderer {
     /// edges. This approximates DoD's cross-round missing-edge store M_w
     /// without forcing BatchMaker or the executor hot path to change again.
     accumulated_missing_support: HashMap<(u64, u64), Stake>,
-    accumulated_missing_support_fifo: VecDeque<(u64, (u64, u64))>,
+    accumulated_missing_pairs_by_tx: HashMap<u64, HashSet<(u64, u64)>>,
+    accumulated_missing_support_fifo: VecDeque<(u64, (u64, u64), Stake)>,
 }
 
 impl GlobalOrderer {
@@ -114,6 +115,7 @@ impl GlobalOrderer {
                 observed_global_batches: HashSet::new(),
                 observed_global_batches_fifo: VecDeque::new(),
                 accumulated_missing_support: HashMap::new(),
+                accumulated_missing_pairs_by_tx: HashMap::new(),
                 accumulated_missing_support_fifo: VecDeque::new(),
             }
             .run()
@@ -304,8 +306,11 @@ impl GlobalOrderer {
     async fn finalize_sequence(&mut self, sequence: u64, graphs: Vec<Batch>) -> bool {
         let name = self.name;
         let committee = self.committee.clone();
-        let accumulated_missing_support =
-            Self::relevant_accumulated_missing_support(&graphs, &self.accumulated_missing_support);
+        let accumulated_missing_support = Self::relevant_accumulated_missing_support(
+            &graphs,
+            &self.accumulated_missing_support,
+            &self.accumulated_missing_pairs_by_tx,
+        );
         let global_batch = tokio::task::spawn_blocking(move || {
             Self::build_global_batch(
                 name,
@@ -400,12 +405,18 @@ impl GlobalOrderer {
                 continue;
             }
 
-            *self
-                .accumulated_missing_support
-                .entry((from, to))
-                .or_insert(0) += author_stake;
+            let pair = (from, to);
+            let entry = self.accumulated_missing_support.entry(pair).or_insert(0);
+            let should_index = *entry == 0;
+            *entry = entry.saturating_add(author_stake);
+            if should_index {
+                Self::index_accumulated_missing_pair(
+                    &mut self.accumulated_missing_pairs_by_tx,
+                    pair,
+                );
+            }
             self.accumulated_missing_support_fifo
-                .push_back((batch.sequence, (from, to)));
+                .push_back((batch.sequence, pair, author_stake));
         }
         self.prune_accumulated_missing_support(batch.sequence);
     }
@@ -413,6 +424,7 @@ impl GlobalOrderer {
     fn relevant_accumulated_missing_support(
         local_graphs: &[Batch],
         accumulated_missing_support: &HashMap<(u64, u64), Stake>,
+        accumulated_missing_pairs_by_tx: &HashMap<u64, HashSet<(u64, u64)>>,
     ) -> HashMap<(u64, u64), Stake> {
         let active_tx_ids: HashSet<_> = local_graphs
             .iter()
@@ -420,17 +432,62 @@ impl GlobalOrderer {
             .filter_map(|tx| parse_transaction_id_and_state_key(tx).map(|(tx_id, _)| tx_id))
             .collect();
 
-        if active_tx_ids.is_empty() || accumulated_missing_support.is_empty() {
+        if active_tx_ids.is_empty()
+            || accumulated_missing_support.is_empty()
+            || accumulated_missing_pairs_by_tx.is_empty()
+        {
             return HashMap::new();
         }
 
-        accumulated_missing_support
-            .iter()
-            .filter_map(|(&(from, to), &support)| {
-                (active_tx_ids.contains(&from) || active_tx_ids.contains(&to))
-                    .then_some(((from, to), support))
+        let mut relevant_pairs = HashSet::new();
+        for &tx_id in &active_tx_ids {
+            if let Some(pairs) = accumulated_missing_pairs_by_tx.get(&tx_id) {
+                relevant_pairs.extend(pairs.iter().copied());
+            }
+        }
+
+        relevant_pairs
+            .into_iter()
+            .filter(|(from, to)| active_tx_ids.contains(from) && active_tx_ids.contains(to))
+            .filter_map(|pair| {
+                accumulated_missing_support
+                    .get(&pair)
+                    .copied()
+                    .map(|support| (pair, support))
             })
             .collect()
+    }
+
+    fn index_accumulated_missing_pair(
+        accumulated_missing_pairs_by_tx: &mut HashMap<u64, HashSet<(u64, u64)>>,
+        pair: (u64, u64),
+    ) {
+        accumulated_missing_pairs_by_tx
+            .entry(pair.0)
+            .or_default()
+            .insert(pair);
+        accumulated_missing_pairs_by_tx
+            .entry(pair.1)
+            .or_default()
+            .insert(pair);
+    }
+
+    fn remove_accumulated_missing_pair_index(
+        accumulated_missing_pairs_by_tx: &mut HashMap<u64, HashSet<(u64, u64)>>,
+        pair: (u64, u64),
+    ) {
+        for tx_id in [pair.0, pair.1] {
+            let should_remove_entry = match accumulated_missing_pairs_by_tx.get_mut(&tx_id) {
+                Some(pairs) => {
+                    pairs.remove(&pair);
+                    pairs.is_empty()
+                }
+                None => false,
+            };
+            if should_remove_entry {
+                accumulated_missing_pairs_by_tx.remove(&tx_id);
+            }
+        }
     }
 
     fn prune_observed_global_batches(&mut self, current_sequence: u64) {
@@ -453,7 +510,9 @@ impl GlobalOrderer {
 
     fn prune_accumulated_missing_support(&mut self, current_sequence: u64) {
         loop {
-            let Some(&(sequence, pair)) = self.accumulated_missing_support_fifo.front() else {
+            let Some(&(sequence, pair, observed_stake)) =
+                self.accumulated_missing_support_fifo.front()
+            else {
                 break;
             };
 
@@ -468,13 +527,17 @@ impl GlobalOrderer {
             self.accumulated_missing_support_fifo.pop_front();
             let should_remove = match self.accumulated_missing_support.get_mut(&pair) {
                 Some(weight) => {
-                    *weight = weight.saturating_sub(1);
+                    *weight = weight.saturating_sub(observed_stake);
                     *weight == 0
                 }
                 None => false,
             };
             if should_remove {
                 self.accumulated_missing_support.remove(&pair);
+                Self::remove_accumulated_missing_pair_index(
+                    &mut self.accumulated_missing_pairs_by_tx,
+                    pair,
+                );
             }
         }
     }
@@ -553,7 +616,6 @@ impl GlobalOrderer {
             &committee,
             &local_graphs,
             &nodes,
-            &accumulated_missing_support,
             pending_threshold,
         );
         Self::linearize_sccs(&mut edges, &sccs);
@@ -936,7 +998,6 @@ impl GlobalOrderer {
         committee: &Committee,
         local_graphs: &[Batch],
         nodes: &HashSet<u64>,
-        accumulated_missing_support: &HashMap<(u64, u64), Stake>,
         threshold: Stake,
     ) -> HashSet<(u64, u64)> {
         let mut weights: HashMap<(u64, u64), Stake> = HashMap::new();
@@ -960,11 +1021,7 @@ impl GlobalOrderer {
 
         weights
             .into_iter()
-            .filter_map(|(pair, support)| {
-                let total_support = support
-                    .saturating_add(accumulated_missing_support.get(&pair).copied().unwrap_or(0));
-                (total_support >= threshold).then_some(pair)
-            })
+            .filter_map(|(pair, support)| (support >= threshold).then_some(pair))
             .collect()
     }
 

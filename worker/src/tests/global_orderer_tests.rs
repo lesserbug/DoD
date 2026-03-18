@@ -2,7 +2,8 @@
 use super::*;
 use crate::batch_maker::parse_transaction_id_and_state_key;
 use crate::common::{committee_with_base_port, keys, standard_transaction};
-use std::collections::HashMap;
+use network::ReliableSender;
+use std::collections::{HashMap, HashSet, VecDeque};
 use tokio::sync::mpsc::channel;
 
 fn make_local_graph(
@@ -761,6 +762,154 @@ async fn ignores_external_missing_pairs_when_accumulating_cross_round_support() 
         }
         other => panic!("Unexpected worker message: {:?}", other),
     }
+}
+
+#[tokio::test]
+async fn does_not_use_accumulated_support_for_external_missing_forwarding() {
+    let (name, _) = keys().pop().unwrap();
+    let committee = committee_with_base_port(14_289);
+    let peers: Vec<_> = committee
+        .others_workers(&name, &0)
+        .into_iter()
+        .map(|(peer, _)| peer)
+        .take(2)
+        .collect();
+
+    let (tx_own, rx_own) = channel(10);
+    let (tx_workers, rx_workers) = channel(10);
+    let (tx_workers_global, rx_workers_global) = channel(10);
+    let (tx_global, mut rx_global) = channel(10);
+
+    GlobalOrderer::spawn_with_global_sync_channel(
+        name,
+        committee,
+        rx_own,
+        rx_workers,
+        rx_workers_global,
+        tx_global,
+        vec![],
+    );
+
+    tx_workers_global
+        .send(make_global_batch_with_missing_edges(
+            peers[0],
+            0,
+            vec![standard_transaction(41, 5), standard_transaction(43, 5)],
+            vec![],
+            vec![(41, 43)],
+        ))
+        .await
+        .unwrap();
+
+    tx_own
+        .send(make_custom_local_graph_with_missing_edges(
+            name,
+            1,
+            vec![standard_transaction(43, 5)],
+            vec![],
+            vec![(41, 43)],
+        ))
+        .await
+        .unwrap();
+
+    tx_workers
+        .send(make_custom_local_graph(
+            peers[0],
+            1,
+            vec![standard_transaction(43, 5)],
+            vec![],
+        ))
+        .await
+        .unwrap();
+
+    tx_workers
+        .send(make_custom_local_graph(
+            peers[1],
+            1,
+            vec![standard_transaction(43, 5)],
+            vec![],
+        ))
+        .await
+        .unwrap();
+
+    let serialized = rx_global
+        .recv()
+        .await
+        .expect("Global orderer did not output a global graph");
+
+    match bincode::deserialize(&serialized).unwrap() {
+        WorkerMessage::GlobalBatch(batch) => {
+            assert_eq!(batch.sequence, 1);
+            assert_eq!(tx_ids(&batch), vec![43]);
+            assert!(batch.edges.is_empty());
+            assert!(
+                batch.missing_edges.is_empty(),
+                "cross-round support should not help external missing forwarding"
+            );
+        }
+        other => panic!("Unexpected worker message: {:?}", other),
+    }
+}
+
+#[test]
+fn prunes_accumulated_missing_support_by_observer_stake() {
+    let (name, _) = keys().pop().unwrap();
+    let mut committee = committee_with_base_port(14_291);
+    let peer = committee
+        .others_workers(&name, &0)
+        .into_iter()
+        .map(|(peer, _)| peer)
+        .next()
+        .unwrap();
+    committee.authorities.get_mut(&peer).unwrap().stake = 3;
+
+    let (_tx_own, rx_own) = channel(1);
+    let (_tx_workers, rx_workers) = channel(1);
+    let (_tx_workers_global, rx_workers_global) = channel(1);
+    let (tx_global, _rx_global) = channel(1);
+    let mut orderer = GlobalOrderer {
+        name,
+        committee,
+        rx_own_local: rx_own,
+        rx_workers_local: rx_workers,
+        rx_workers_global,
+        tx_global,
+        workers_addresses: vec![],
+        network: ReliableSender::new(),
+        sequences: HashMap::new(),
+        finalized: HashSet::new(),
+        observed_global_batches: HashSet::new(),
+        observed_global_batches_fifo: VecDeque::new(),
+        accumulated_missing_support: HashMap::new(),
+        accumulated_missing_pairs_by_tx: HashMap::new(),
+        accumulated_missing_support_fifo: VecDeque::new(),
+    };
+
+    orderer.observe_global_batch(&Batch {
+        author: peer,
+        sequence: 0,
+        transactions: vec![standard_transaction(41, 5), standard_transaction(43, 5)],
+        edges: Vec::new(),
+        missing_edges: vec![(41, 43)],
+    });
+
+    assert_eq!(orderer.accumulated_missing_support.get(&(41, 43)), Some(&3));
+    assert!(orderer
+        .accumulated_missing_pairs_by_tx
+        .get(&41)
+        .is_some_and(|pairs| pairs.contains(&(41, 43))));
+
+    orderer.prune_accumulated_missing_support(300);
+
+    assert!(
+        !orderer.accumulated_missing_support.contains_key(&(41, 43)),
+        "stake-aware pruning should fully retire the observation"
+    );
+    assert!(match orderer.accumulated_missing_pairs_by_tx.get(&41) {
+        Some(pairs) => pairs.is_empty(),
+        None => true,
+    });
+    assert!(orderer.accumulated_missing_support_fifo.is_empty());
 }
 
 #[tokio::test]
