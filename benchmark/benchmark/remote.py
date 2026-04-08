@@ -71,7 +71,13 @@ class Bench:
             'sudo apt-get install -y clang',
 
             # Clone the repo.
-            f'(git clone {self.settings.repo_url} || (cd {self.settings.repo_name} ; git pull))'
+            (
+                f'(if [ -d {self.settings.repo_name}/.git ]; then '
+                f'cd {self.settings.repo_name} && git pull; '
+                f'elif [ -e {self.settings.repo_name} ]; then '
+                f'echo "{self.settings.repo_name} exists but is not a git repository" >&2 && exit 1; '
+                f'else git clone {self.settings.repo_url} {self.settings.repo_name}; fi)'
+            )
         ]
         hosts = self.manager.hosts(flat=True)
         try:
@@ -146,6 +152,7 @@ class Bench:
             f'Updating {len(ips)} machines (branch "{self.settings.branch}")...'
         )
         cmd = [
+            f'test -d {self.settings.repo_name}/.git',
             f'(cd {self.settings.repo_name} && git fetch -f)',
             f'(cd {self.settings.repo_name} && git checkout -f {self.settings.branch})',
             f'(cd {self.settings.repo_name} && git pull -f)',
