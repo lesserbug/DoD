@@ -1,71 +1,71 @@
-> **Note to readers:** MystenLabs is making this codebase production-ready [here](https://github.com/MystenLabs/sui/tree/main/narwhal).
+# DoD-Style Graph-Ordering Reference
 
-# Narwhal and Tusk
+This repository contains a DoD-style graph-ordering reference implemented in the same Narwhal/Tusk-based experimental harness used for MRV.
 
-[![build status](https://img.shields.io/github/actions/workflow/status/asonnino/narwhal/rust.yml?branch=master&logo=github&style=flat-square)](https://github.com/asonnino/narwhal/actions)
-[![rustc](https://img.shields.io/badge/rustc-1.51+-blue?style=flat-square&logo=rust)](https://www.rust-lang.org)
-[![python](https://img.shields.io/badge/python-3.9-blue?style=flat-square&logo=python&logoColor=white)](https://www.python.org/downloads/release/python-390/)
-[![license](https://img.shields.io/badge/license-Apache-blue.svg?style=flat-square)](LICENSE)
+The implementation is included to provide a nearby DAG-BFT order-fairness design point for comparison: unlike MRV, which derives structural ordering constraints after consensus from the committed DAG, the DoD-style reference carries explicit graph-based ordering information through the system pipeline.
 
-This repo provides an implementation of [Narwhal and Tusk](https://arxiv.org/pdf/2105.11827.pdf). The codebase has been designed to be small, efficient, and easy to benchmark and modify. It has not been designed to run in production but uses real cryptography ([dalek](https://doc.dalek.rs/ed25519_dalek)), networking ([tokio](https://docs.rs/tokio)), and storage ([rocksdb](https://docs.rs/rocksdb)).
+## Scope
 
-## Quick Start
+This is an independent reference implementation based on the design described in the DoD paper. It is not the official DoD implementation, and it should not be interpreted as a reproduction of DoD's published artifact or performance numbers.
 
-The core protocols are written in Rust, but all benchmarking scripts are written in Python and run with [Fabric](http://www.fabfile.org/).
-To deploy and benchmark a testbed of 4 nodes on your local machine, clone the repo and install the python dependencies:
+The original DoD code was not publicly available to us at the time of implementation. We therefore implemented the relevant graph-ordering workflow inside our Narwhal/Tusk benchmark harness to compare the system-level cost of explicit graph-based ordering against MRV's post-consensus interpretation approach.
 
+## What Is Implemented
+
+At a high level, this reference follows the DoD-style pipeline:
+
+1. Workers disseminate local-order graph information through the Narwhal/Tusk mempool path.
+2. The system derives a global-order graph locally.
+3. The graph is processed in the role normally played by a transaction batch in the Tusk execution pipeline.
+4. End-to-end throughput and latency are measured using the same benchmark harness as the MRV experiments.
+
+## Important Differences from Published DoD Results
+
+This implementation is intended as a controlled reference point within our experimental harness, not as an apples-to-apples reproduction of the DoD evaluation.
+
+Key differences include:
+
+- **Implementation**: this is our independent DoD-style implementation, not the original authors' code.
+- **Deployment**: our experiments use the same AWS-based Narwhal/Tusk benchmark environment as MRV, which differs from the CloudLab bare-metal environment used in DoD's published evaluation.
+- **Workload structure**: DoD's reported performance benefits from data-dependent fairness, where ordering constraints are added mainly between dependent transaction pairs. Workloads with sparse dependencies produce much sparser graphs than workloads where most transactions are mutually dependent.
+- **Purpose**: the goal is to compare design points inside one harness: explicit graph-ordering in the pipeline versus MRV's post-consensus structural interpretation.
+
+For these reasons, the throughput and latency numbers reported for this reference should be interpreted as measurements of our DoD-style design point under our benchmark setting, rather than as claims about the original DoD implementation.
+
+## Metrics
+
+The benchmark output reports several metrics:
+
+- **Consensus TPS / latency:** throughput and latency of the consensus commit path.
+- **End-to-end TPS / latency:** client-perceived throughput and latency up to commit.
+- **Execution TPS / latency:** throughput and latency up to execution of globally ordered graph batches.
+
+For experiments that evaluate complete transaction ordering and confirmation, we use **Execution TPS** and **Execution latency** as the primary DoD-style metrics. The stage breakdown is also useful for diagnosing where time is spent:
+
+- `Client -> local graph`
+- `Local graph -> global graph`
+- `Global graph -> commit`
+- `Commit -> execute`
+
+## Running Experiments
+
+Use the benchmark scripts in the repository's `benchmark/` directory. The workflow follows the same local and remote benchmark structure used by the MRV artifact.
+
+Typical local run:
+
+```bash
+cd benchmark
+pip install -r requirements.txt
+fab local
 ```
-$ git clone https://github.com/asonnino/narwhal.git
-$ cd narwhal/benchmark
-$ pip install -r requirements.txt
+
+For AWS experiments, edit `benchmark/settings.json` with the appropriate repository, branch, SSH key, instance type, and regions, then use:
+
+```bash
+fab create --nodes=1
+fab install
+fab remote
+fab stop
 ```
 
-You also need to install Clang (required by rocksdb) and [tmux](https://linuxize.com/post/getting-started-with-tmux/#installing-tmux) (which runs all nodes and clients in the background). Finally, run a local benchmark using fabric:
-
-```
-$ fab local
-```
-
-This command may take a long time the first time you run it (compiling rust code in `release` mode may be slow) and you can customize a number of benchmark parameters in `fabfile.py`. When the benchmark terminates, it displays a summary of the execution similarly to the one below.
-
-```
------------------------------------------
- SUMMARY:
------------------------------------------
- + CONFIG:
- Faults: 0 node(s)
- Committee size: 4 node(s)
- Worker(s) per node: 1 worker(s)
- Collocate primary and workers: True
- Input rate: 50,000 tx/s
- Transaction size: 512 B
- Execution time: 19 s
-
- Header size: 1,000 B
- Max header delay: 100 ms
- GC depth: 50 round(s)
- Sync retry delay: 10,000 ms
- Sync retry nodes: 3 node(s)
- batch size: 500,000 B
- Max batch delay: 100 ms
-
- + RESULTS:
- Consensus TPS: 46,478 tx/s
- Consensus BPS: 23,796,531 B/s
- Consensus latency: 464 ms
-
- End-to-end TPS: 46,149 tx/s
- End-to-end BPS: 23,628,541 B/s
- End-to-end latency: 557 ms
------------------------------------------
-```
-
-## Next Steps
-
-The next step is to read the paper [Narwhal and Tusk: A DAG-based Mempool and Efficient BFT Consensus](https://arxiv.org/pdf/2105.11827.pdf). It is then recommended to have a look at the README files of the [worker](https://github.com/asonnino/narwhal/tree/master/worker) and [primary](https://github.com/asonnino/narwhal/tree/master/primary) crates. An additional resource to better understand the Tusk consensus protocol is the paper [All You Need is DAG](https://arxiv.org/abs/2102.08325) as it describes a similar protocol.
-
-The README file of the [benchmark folder](https://github.com/asonnino/narwhal/tree/master/benchmark) explains how to benchmark the codebase and read benchmarks' results. It also provides a step-by-step tutorial to run benchmarks on [Amazon Web Services (AWS)](https://aws.amazon.com) accross multiple data centers (WAN).
-
-## License
-
-This software is licensed as [Apache 2.0](LICENSE).
+Use `fab destroy` when the AWS testbed is no longer needed.
